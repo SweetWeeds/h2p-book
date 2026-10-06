@@ -1,0 +1,1535 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>5장 · 값과 선행 계산: Branch Runahead, TEA, RUNLTS — BranchBook</title>
+<meta name="description" content="분기 방향이 방금 읽은 값에 달려 있으면 history에는 답이 없다. 필요한 계산만 먼저 실행하는 Branch Runahead와 TEA, 이미 나온 register 값을 읽는 RUNLTS를 실험으로 배운다.">
+<link rel="icon" href="../favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/common.js"></script>
+<style>
+  /* 실험 4의 두 부분(가, 나)을 바꾸는 선택 줄 */
+  .simulator-tabs { padding: 12px 18px; border-bottom: 1px solid var(--border); }
+  /* 64-bit 값 두 개를 나란히 놓고 bit를 눌러 바꾸는 편집기 */
+  .bit-editor { display: grid; gap: 22px; grid-template-columns: minmax(0, 1fr); padding: 4px 4px 0; }
+  @media (min-width: 900px) { .bit-editor { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } }
+  .bit-value { min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+  .hex-input { width: 100%; height: 38px; padding: 0 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--elevated); color: var(--text); font-family: var(--mono); font-size: 15px; letter-spacing: 0.04em; }
+  .hex-input.is-invalid { border-color: var(--mispredict); }
+  .bit-grid { display: grid; grid-template-columns: repeat(16, minmax(0, 1fr)); gap: 2px; }
+  .bit-cell { height: 24px; padding: 0; border: 1px solid var(--border); border-radius: 4px; background: var(--elevated); color: var(--text-faint); font-family: var(--mono); font-size: 11px; cursor: pointer; }
+  .bit-cell.is-one { background: var(--surface-strong); color: var(--text); font-weight: 600; }
+  .bit-cell.in-leading-run { box-shadow: inset 0 3px 0 var(--series-4); }
+  .bit-cell.in-trailing-run { box-shadow: inset 0 -3px 0 var(--series-3); }
+  .bit-cell.in-leading-run.in-trailing-run { box-shadow: inset 0 3px 0 var(--series-4), inset 0 -3px 0 var(--series-3); }
+  .bit-cell.in-low-bits { border-color: var(--series-2); border-width: 2px; }
+  .bit-grid-caption { font-size: 12.5px; color: var(--text-dim); margin: 0; }
+  .digest-breakdown { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 3px 14px; font-size: 13px; line-height: 1.6; color: var(--text-dim); }
+  .digest-breakdown-value { font-family: var(--mono); color: var(--text); overflow-wrap: anywhere; }
+  .digest-breakdown-value b { color: var(--accent); }
+</style>
+</head>
+<body data-root="../" data-chapter="value">
+<main class="chapter">
+  <header class="chapter-hero">
+    <p class="chapter-kicker"></p>
+    <h1>값과 선행 계산: Branch Runahead, TEA, RUNLTS</h1>
+    <p class="lead">어떤 분기는 방금 메모리에서 읽은 값이 방향을 정한다. 그 값은 과거의 taken, not-taken 기록 어디에도 적혀 있지 않다. 이 장의 세 논문은 history 밖에서 정보를 가져온다. 둘은 분기에 필요한 계산만 먼저 실행하고, 하나는 이미 계산이 끝난 register 값을 읽는다.</p>
+    <div class="objectives">
+      <p class="objectives-title">이 장에서 배우는 것</p>
+      <ul>
+        <li>값에 의존하는 분기가 왜 history 기반 예측기로 풀리지 않는지 실제 예측기를 돌려 확인한다.</li>
+        <li>Branch Runahead가 dependence chain을 뽑아 먼저 실행하는 구조와, 결과가 제때 도착해야 한다는 제약을 이해한다.</li>
+        <li>TEA가 도착 기한을 "예측 전"에서 "실행 전"으로 늦춰 얻는 것과 치르는 비용을 설명할 수 있다.</li>
+        <li>RUNLTS가 register 값을 12-bit digest로 줄여 예측의 단서로 쓰는 방식과, digest가 잃는 정보를 안다.</li>
+      </ul>
+    </div>
+  </header>
+
+  <!-- ============================================================ 1 -->
+  <section id="value-dependent">
+    <h2>History에 답이 없는 분기</h2>
+    <p><a href="history.html">2장</a>에서 본 예측기는 모두 같은 가정 위에 서 있다. 다음 방향의 단서가 과거 방향 기록 안에 들어 있다는 가정이다. <a href="correlation.html">4장</a>의 BranchNet도 같은 history에서 단서를 더 잘 찾는 방법이었다. 그런데 이 가정이 아예 성립하지 않는 분기가 있다.</p>
+<pre><code>for (i = 0; i &lt; n; i++) {
+  v = A[i];              // 메모리에서 값을 읽는다
+  do_other_work();       // v와 무관한 다른 일
+  if (v &gt; threshold)     // 방향은 v가 정한다
+    process(i);
+}</code></pre>
+    <p>이 <code>if</code>의 방향은 <code>A[i]</code>의 값이 정한다. 이런 분기를 <span class="term">값 의존 분기</span><span class="english">(data-dependent branch)</span>라고 부른다. 예측기가 fetch에서 방향을 골라야 하는 순간에 <code>A[i]</code>는 아직 읽지도 않았다. 값은 load가 execute를 마쳐야 나온다.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 250" role="img" aria-label="분기 방향은 메모리에서 읽은 값이 비교를 거쳐 정한다. 예측기가 가진 방향 history에는 그 값이 들어 있지 않다.">
+        <defs><marker id="value-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrow-head"/></marker></defs>
+        <text x="20" y="28" class="label-strong">분기 방향을 정하는 정보가 흐르는 길</text>
+        <rect x="20" y="50" width="140" height="54" rx="9" class="fill-surface"/><text x="90" y="74" text-anchor="middle" class="label-strong">메모리</text><text x="90" y="93" text-anchor="middle" class="label-mono">A[i]</text>
+        <path d="M164 77 H186" class="stroke-line" marker-end="url(#value-arrow)"/>
+        <rect x="190" y="50" width="160" height="54" rx="9" class="fill-accent-soft"/><text x="270" y="74" text-anchor="middle" class="label-strong">load</text><text x="270" y="93" text-anchor="middle" class="label-mono">v = A[i]</text>
+        <path d="M354 77 H376" class="stroke-line" marker-end="url(#value-arrow)"/>
+        <rect x="380" y="50" width="200" height="54" rx="9" class="fill-accent-soft"/><text x="480" y="74" text-anchor="middle" class="label-strong">비교</text><text x="480" y="93" text-anchor="middle" class="label-mono">v &gt; threshold</text>
+        <path d="M584 77 H606" class="stroke-line" marker-end="url(#value-arrow)"/>
+        <rect x="610" y="50" width="230" height="54" rx="9" class="fill-surface"/><text x="725" y="74" text-anchor="middle" class="label-strong">분기 방향</text><text x="725" y="93" text-anchor="middle" class="label-dim">taken 또는 not-taken</text>
+        <text x="270" y="127" text-anchor="middle" class="label-accent">값은 execute에서야 나온다</text>
+        <text x="700" y="127" text-anchor="middle" class="label-accent">방향은 fetch에서 필요하다</text>
+        <rect x="20" y="150" width="400" height="54" rx="9" class="fill-elevated"/>
+        <text x="36" y="174" class="label-strong">예측기가 가진 것: 방향 history</text>
+        <text x="36" y="193" class="label-mono">T N T T N N T N T …</text>
+        <path d="M424 177 H810 V110" class="stroke-dashed" marker-end="url(#value-arrow)"/>
+        <text x="617" y="168" text-anchor="middle" class="label-dim">과거 방향만 전달된다. 다음 A[i]의 값은 여기에 없다</text>
+        <text x="20" y="234" class="label-dim">A[i]가 앞의 값들과 무관하면, history를 아무리 길게 보아도 v &gt; threshold의 답을 알 수 없다.</text>
+      </svg>
+      <figcaption><b>그림 5-1.</b> 방향을 정하는 정보는 메모리, load, 비교를 거쳐 온다. 예측기가 보는 history에는 과거의 방향만 있고 다음에 읽을 값은 없다.</figcaption>
+    </figure>
+    <p>그렇다고 값 의존 분기가 모두 어려운 것은 아니다. 배열이 정렬되어 있거나 값이 한쪽으로 치우쳐 있으면 방향열에 규칙이 생기고, 예측기는 값이 아니라 그 규칙을 배운다. 어려워지는 것은 값들이 서로 무관할 때다. 아래 실험에서 배열의 내용만 바꿔 가며 같은 분기를 실제 예측기로 돌려 보자.</p>
+
+    <div class="simulator" id="simulator-value">
+      <div class="simulator-head"><span class="simulator-tag">실험 1</span><h3>값이 결정하는 분기</h3></div>
+      <div class="simulator-body side">
+        <div class="simulator-view">
+          <div class="legend"><span><i style="background:var(--taken)"></i>threshold보다 큰 값 (taken)</span><span><i style="background:var(--not-taken)"></i>작거나 같은 값 (not-taken)</span><span><i style="background:var(--accent-soft); box-shadow: 0 0 0 1px var(--accent)"></i>아래 결과열에 보이는 구간</span></div>
+          <canvas id="value-canvas" data-height="220" aria-label="배열 A의 값과 threshold. 값이 threshold보다 크면 분기가 taken이다."></canvas>
+          <div style="padding: 4px 6px 6px">
+            <div class="legend"><span><i style="background:transparent; box-shadow: 0 0 0 2px var(--mispredict)"></i>✕ TAGE가 틀린 분기</span><span id="value-window-label"></span></div>
+            <div id="value-strip" aria-live="polite"></div>
+          </div>
+          <canvas id="value-accuracy-canvas" data-height="140" aria-label="다수 방향만 찍기, gshare, TAGE의 정확도 막대"></canvas>
+        </div>
+        <div class="simulator-controls">
+          <div class="control"><span>배열 A의 내용</span><div class="segmented" id="value-distribution"><button data-value="sorted">정렬됨</button><button data-value="periodic">주기 8로 반복</button><button data-value="skewed">대부분 작은 값</button><button data-value="random" class="on">무작위</button></div></div>
+          <label class="control"><span>threshold <output id="value-threshold-output"></output></span><input type="range" id="value-threshold" min="5" max="95" step="1" value="50"></label>
+          <div class="control-row"><button class="button" id="value-reseed">다른 데이터 뽑기</button></div>
+        </div>
+      </div>
+      <div class="simulator-readout">
+        <div class="statistic"><span class="statistic-label">taken 비율</span><span class="statistic-value" id="value-taken-share">—</span></div>
+        <div class="statistic"><span class="statistic-label">다수 방향만 찍기</span><span class="statistic-value" id="value-majority">—</span></div>
+        <div class="statistic"><span class="statistic-label">gshare</span><span class="statistic-value" id="value-gshare">—</span></div>
+        <div class="statistic"><span class="statistic-label">TAGE</span><span class="statistic-value" id="value-tage">—</span></div>
+      </div>
+      <div class="simulator-note"><b>설명용 모델.</b> 원소 2,400개인 배열을 한 번 훑으며 <code>if (A[i] &gt; threshold)</code> 분기 하나만 예측기에 넣었다. gshare(history 12개)와 TAGE(history 4, 8, 16, 32개)는 이 책의 축소 구현이다. "다수 방향만 찍기"는 더 자주 나온 방향 하나만 계속 고를 때의 정확도다. <b>해 볼 것.</b> 정렬됨과 주기 반복에서는 두 예측기가 거의 다 맞힌다. 무작위로 바꾸면 "다수 방향만 찍기"를 넘지 못한다. threshold를 끝으로 밀면 정확도 숫자는 올라가지만, 그것은 방향이 한쪽으로 쏠렸기 때문이지 값을 알아맞혔기 때문이 아니다.</div>
+    </div>
+    <p>무작위 데이터에서 눈여겨볼 점이 둘 있다. 첫째, history를 쓰는 두 예측기가 history를 전혀 쓰지 않는 "다수 방향만 찍기"보다 낫지 않다. history에 단서가 없다는 뜻이다. 둘째, 가끔은 오히려 더 나쁘다. 예측기가 우연히 생긴 무늬를 규칙으로 착각하고 따라가기 때문이다.</p>
+    <p>예측기를 키워도 이 사정은 달라지지 않는다. 표가 커지면 더 많은 패턴을 기억할 수 있을 뿐, 기억할 패턴이 없는 분기에는 소용이 없다.</p>
+    <div class="callout evidence">
+      <strong>논문이 보고한 값: 용량을 늘려도 남는 오예측</strong>
+      <p>Branch Runahead 논문의 Fig. 1은 benchmark마다 가장 예측하기 어려운 분기 32개를 골라 오예측률을 잰다. 평균은 64KB TAGE-SC-L에서 11%, 저장 공간에 제한이 없는 MTAGE-SC에서 9%다. 같은 분기의 결과를 dependence chain으로 미리 계산하면 5%로 내려간다. 조건: SPEC CPU2006/2017 정수와 GAP 중 MPKI가 2보다 큰 17개 benchmark.</p>
+    </div>
+    <p>그래서 이 장의 논문들은 예측기를 고치는 대신 정보를 바꾼다. 길은 두 갈래다.</p>
+    <ul>
+      <li><strong>값을 만드는 계산을 먼저 실행한다.</strong> 분기의 답을 내는 데 필요한 명령만 골라 main보다 앞서 돌린다. <a href="#runahead">Branch Runahead</a>와 <a href="#tea">TEA</a>가 이 길이다. 두 논문의 차이는 결과가 언제까지 도착해야 쓸모가 있느냐에 있다.</li>
+      <li><strong>이미 만들어진 값을 읽는다.</strong> 프로그램이 평소대로 실행하며 register에 써 둔 값을 예측기의 입력으로 삼는다. <a href="#runlts">RUNLTS</a>가 이 길이다.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ 2 -->
+  <section id="runahead">
+    <h2>Branch Runahead: 필요한 계산만 먼저 실행한다</h2>
+    <div class="paper-card">
+      <span class="paper-title">Branch Runahead: An Alternative to Branch Prediction for Impossible to Predict Branches</span>
+      <span class="paper-meta">Stephen Pruett, Yale N. Patt · MICRO 2021 · <a href="https://utw10235.utweb.utexas.edu/pub/PruettPatt_BranchRunahead.pdf" rel="noopener">원문</a></span>
+      <span class="paper-scope">평가 조건: baseline 64KB TAGE-SC-L, SPEC CPU2006/2017 정수와 GAP 중 MPKI가 2보다 큰 17개 benchmark, 4-wide 비순차 실행 코어(ROB 256) · <b>근거 범위: 논문 전문</b></span>
+    </div>
+
+    <h3>문제: 미리 계산하는 방법은 있었지만 무거웠다</h3>
+    <p>분기의 답을 미리 계산하자는 생각은 새롭지 않다. 이전 연구는 컴파일러가 프로그램을 걸러 <span class="term">helper thread</span>를 만들고, 이를 다른 코어나 같은 코어의 다른 thread 자리에서 돌렸다. 논문은 이 방식이 프로그램의 명령 대부분을 다시 실행하게 되어 비싸다고 지적한다. 반대로 실행 중에 가벼운 명령 묶음을 뽑는 방식은 끊기지 않고 계속 돌리기가 어려워 결과가 제때 나오지 않았다.</p>
+
+    <h3>아이디어: dependence chain을 뽑아 따로 돌린다</h3>
+    <p>분기의 조건을 계산하는 데 실제로 쓰이는 명령은 루프 본문의 일부뿐이다. 분기에서 출발해 "이 값은 누가 만들었나"를 거꾸로 따라가면 필요한 명령만 남는다. 이 묶음을 <span class="term">dependence chain</span>이라고 한다. 논문의 표현으로는 분기를 계산하는 backward dataflow slice다.</p>
+<pre><code>loop:  i = i + 1               ← chain (다음 원소의 위치)
+       v = load A[i]           ← chain (값 읽기)
+       ... do_other_work ...   ← 건너뛴다 (분기와 무관)
+       compare v, threshold    ← chain (조건 계산)
+       branch if greater       ← 예측하기 어려운 분기</code></pre>
+    <p>논문은 chain을 일부러 단순하게 제한한다. 한 chain은 micro-op 16개 미만이고, 정수 나눗셈과 부동소수점 연산을 넣지 않으며, 분기 같은 제어 흐름 명령도 넣지 않는다. store와 그 값을 읽는 load의 짝은 값 전달로 바꿔 없애므로 chain에는 store도 남지 않는다. 논문 Fig. 2에 따르면 chain의 평균 길이는 micro-op 8개 미만이다.</p>
+    <p>구조는 세 부분으로 나뉜다.</p>
+    <ul>
+      <li><strong>추출.</strong> 실행을 마치고 나가는(retire) 명령을 지켜본다. <span class="term">Hard Branch Table</span>이 분기마다 오예측 횟수를 세어 어려운 분기를 가려낸다. 그런 분기가 retire되면, 최근에 retire된 micro-op 512개를 담은 순환 buffer(Chain Extraction Buffer)를 거꾸로 훑어 chain을 만든다.</li>
+      <li><strong>실행.</strong> 뽑은 chain은 <span class="term">Dependence Chain Engine</span>이라는 전용 장치에 설치된다. chain은 처음에 올바른 입력값이 필요하므로, 코어에서 오예측이 난 순간에 register 값을 복사받아 출발한다. 그 뒤로는 자기가 낸 결과로 다음 chain을 이어서 시작하며 main과 무관하게 계속 달린다.</li>
+      <li><strong>전달.</strong> chain이 낸 방향은 분기마다 따로 둔 <span class="term">prediction queue</span>에 순서대로 쌓인다. main이 그 분기를 fetch할 때 queue에 결과가 있으면 TAGE-SC-L의 예측 대신 그것을 쓴다.</li>
+    </ul>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 322" role="img" aria-label="Branch Runahead가 pipeline에 더한 부분. Retire에서 chain을 뽑아 Dependence Chain Engine에 설치하고, 결과를 Prediction Queue를 거쳐 Fetch에 전달한다.">
+        <defs><marker id="value-runahead-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrow-head-accent"/></marker></defs>
+        <text x="20" y="26" class="label-strong">위: 원래의 비순차 실행 pipeline · 아래: Branch Runahead가 더한 부분</text>
+        <g>
+          <rect x="20" y="44" width="110" height="50" rx="9" class="fill-surface"/><text x="75" y="74" text-anchor="middle" class="label-strong">Fetch</text>
+          <rect x="138" y="44" width="110" height="50" rx="9" class="fill-surface"/><text x="193" y="74" text-anchor="middle" class="label">Decode</text>
+          <rect x="256" y="44" width="110" height="50" rx="9" class="fill-surface"/><text x="311" y="74" text-anchor="middle" class="label">Rename</text>
+          <rect x="374" y="44" width="110" height="50" rx="9" class="fill-surface"/><text x="429" y="65" text-anchor="middle" class="label">Reservation</text><text x="429" y="83" text-anchor="middle" class="label">Station</text>
+          <rect x="492" y="44" width="110" height="50" rx="9" class="fill-surface"/><text x="547" y="65" text-anchor="middle" class="label">Physical</text><text x="547" y="83" text-anchor="middle" class="label">Register</text>
+          <rect x="610" y="44" width="110" height="50" rx="9" class="fill-surface"/><text x="665" y="74" text-anchor="middle" class="label">Execute</text>
+          <rect x="728" y="44" width="110" height="50" rx="9" class="fill-surface"/><text x="783" y="74" text-anchor="middle" class="label-strong">Retire</text>
+        </g>
+        <rect x="20" y="204" width="160" height="62" rx="10" class="fill-accent-soft"/><text x="100" y="230" text-anchor="middle" class="label-strong">Prediction Queue</text><text x="100" y="250" text-anchor="middle" class="label-dim">반복 순서대로 결과 보관</text>
+        <rect x="256" y="204" width="346" height="62" rx="10" class="fill-accent-soft"/><text x="429" y="230" text-anchor="middle" class="label-strong">Dependence Chain Engine</text><text x="429" y="250" text-anchor="middle" class="label-dim">뽑아 둔 chain만 반복해서 실행한다</text>
+        <rect x="670" y="204" width="170" height="62" rx="10" class="fill-accent-soft"/><text x="755" y="230" text-anchor="middle" class="label-strong">Chain 추출</text><text x="755" y="250" text-anchor="middle" class="label-dim">Hard Branch Table 외</text>
+        <path d="M783 98 V200" class="stroke-accent" marker-end="url(#value-runahead-arrow)"/>
+        <path d="M547 98 V200" class="stroke-accent" marker-end="url(#value-runahead-arrow)"/>
+        <path d="M666 235 H606" class="stroke-accent" marker-end="url(#value-runahead-arrow)"/>
+        <path d="M252 235 H184" class="stroke-accent" marker-end="url(#value-runahead-arrow)"/>
+        <path d="M75 200 V98" class="stroke-accent" marker-end="url(#value-runahead-arrow)"/>
+        <text x="88" y="146" class="label-dim">결과가 준비되어 있으면</text>
+        <text x="88" y="164" class="label-dim">TAGE-SC-L 대신 쓴다</text>
+        <text x="537" y="146" text-anchor="end" class="label-dim">오예측이 난 순간에</text>
+        <text x="537" y="164" text-anchor="end" class="label-dim">chain의 입력값을 복사한다</text>
+        <text x="773" y="146" text-anchor="end" class="label-dim">실행이 끝난 명령에서</text>
+        <text x="773" y="164" text-anchor="end" class="label-dim">chain을 뽑는다</text>
+        <text x="636" y="226" text-anchor="middle" class="label-dim">설치</text>
+        <text x="218" y="226" text-anchor="middle" class="label-dim">결과</text>
+        <text x="20" y="300" class="label-dim">Prediction Queue는 분기마다 따로 둔다. Dependence Chain Engine은 main의 fetch 순서를 기다리지 않고 앞서 달린다.</text>
+      </svg>
+      <figcaption><b>그림 5-2.</b> Branch Runahead의 구조. 원문 Fig. 6(Pipeline Modifications)을 다시 그렸다. 보라색 상자가 새로 더한 부분이다. 원문에는 분기 사이의 의존 관계(affector, guard)를 찾는 장치도 있는데 이 그림에서는 "Chain 추출"에 묶었다.</figcaption>
+    </figure>
+
+    <h3>동작 예시: 정확한 답도 늦으면 쓸 수 없다</h3>
+    <p>같은 분기는 루프를 돌 때마다 다시 실행된다. helper가 낸 결과는 "몇 번째 반복의 답인가"가 맞아야 한다. prediction queue는 결과를 반복 순서대로 쌓고, main은 그 분기를 만날 때마다 한 칸씩 꺼내 쓴다. 그래서 순서는 queue가 지켜 준다.</p>
+    <p>남는 문제는 시간이다. main이 i번째 분기를 fetch하는 순간에 i번째 결과가 queue에 있어야 한다. 아직 없으면 main은 그냥 TAGE-SC-L의 예측으로 간다. 논문은 이때 그 칸을 "이미 쓴 것"으로 표시하고, 늦게 도착한 결과는 복구에 대비해 채워만 둔다고 설명한다.</p>
+    <p>helper가 main을 앞설 수 있는 이유는 하나다. main은 루프 본문 전체를 가져와야 하지만 helper는 chain만 실행한다. 본문에서 건너뛰는 일이 많을수록 helper가 유리하고, chain 안의 load가 느릴수록 불리하다. 아래에서 직접 경주시켜 보자.</p>
+
+    <div class="simulator" id="simulator-race">
+      <div class="simulator-head"><span class="simulator-tag">실험 2</span><h3>helper와 main의 경주</h3></div>
+      <div class="simulator-body side">
+        <div class="simulator-view">
+          <div class="legend">
+            <span><i class="line" style="background:var(--series-1)"></i>main이 그 반복의 분기를 fetch한 시각</span>
+            <span><i class="line" style="background:var(--series-2)"></i>helper가 그 반복의 결과를 낸 시각</span>
+            <span><i class="line" style="background:var(--text-faint)"></i>helper가 없을 때의 main</span>
+          </div>
+          <canvas id="race-canvas" data-height="350" aria-label="시간에 따라 main과 helper가 도달한 반복 번호. 아래 띠는 반복마다 helper의 결과가 제때 왔는지를 보인다."></canvas>
+          <div class="legend" style="padding-top: 8px">
+            <span><i style="background:var(--series-2)"></i>제때 도착 (helper 결과 사용)</span>
+            <span><i style="background:var(--surface-strong); box-shadow: 0 0 0 1px var(--border)"></i>늦음, 예측기가 맞힘</span>
+            <span><i style="background:var(--mispredict)"></i>✕ 늦음, 예측기도 틀림</span>
+          </div>
+        </div>
+        <div class="simulator-controls">
+          <label class="control"><span>루프 본문 길이 <output id="race-body-output"></output></span><input type="range" id="race-body" min="16" max="96" step="4" value="40"></label>
+          <label class="control"><span>chain 길이 <output id="race-chain-output"></output></span><input type="range" id="race-chain" min="2" max="15" step="1" value="6"></label>
+          <label class="control"><span>chain 안 load의 지연 <output id="race-latency-output"></output></span><input type="range" id="race-latency" min="2" max="150" step="1" value="4"></label>
+          <div class="control"><span>다음 chain을 시작하는 때</span><div class="segmented" id="race-start"><button data-value="serial" class="on">앞 chain이 끝난 뒤</button><button data-value="overlapped">끝나기 전에 겹쳐서</button></div></div>
+        </div>
+      </div>
+      <div class="simulator-readout">
+        <div class="statistic"><span class="statistic-label">main의 한 반복</span><span class="statistic-value" id="race-main-pace">—</span></div>
+        <div class="statistic"><span class="statistic-label">chain 하나의 실행</span><span class="statistic-value" id="race-helper-pace">—</span></div>
+        <div class="statistic"><span class="statistic-label">제때 도착한 분기</span><span class="statistic-value" id="race-coverage">—</span></div>
+        <div class="statistic"><span class="statistic-label">오예측 수</span><span class="statistic-value" id="race-mispredictions">—</span></div>
+        <div class="statistic"><span class="statistic-label">실행 시간</span><span class="statistic-value" id="race-time">—</span></div>
+      </div>
+      <div class="simulator-note"><b>설명용 모델.</b> 루프를 48번 돈다. main은 cycle당 명령 4개를 가져오고, 오예측 한 번에 14 cycle을 잃는다. helper가 늦은 반복에서는 예측기가 30% 확률로 틀린다고 정했다(틀리는 반복은 고정). chain은 명령이 차례로 이어져 "길이 − 1 + load 지연" cycle이 걸리고, helper는 main보다 최대 8개 반복까지만 앞설 수 있다. helper의 계산은 항상 옳다고 가정했다. 두 흐름은 반복 0에서 함께 출발한다. <b>해 볼 것.</b> 본문 길이를 줄이거나 load 지연을 올리면 주황색 선이 보라색 선 아래로 처지고 띠가 회색과 빨강으로 바뀐다. 그 상태에서 "끝나기 전에 겹쳐서"로 바꾸면 다시 앞선다. load 지연을 100 cycle 넘게 올리면 겹쳐도 진다.</div>
+    </div>
+    <p>그래프에서 위에 있는 선이 앞서 있는 쪽이다. 주황색 선이 보라색 선보다 위에 있는 반복에서는 결과가 미리 와 있었고, 그 분기는 오예측이 나지 않는다. 보라색 선의 평평한 구간은 오예측으로 main이 멈춘 시간이다. 뒤처진 helper는 이 틈에 거리를 좁힌다. 논문에서도 chain은 오예측이 난 순간에 출발하므로, 동기화 직후의 몇 반복은 늦는 것이 정상이다.</p>
+    <p>"끝나기 전에 겹쳐서"는 논문이 chain-level parallelism이라고 부르는 효과다. <code>A[i]</code>의 load와 <code>A[i+1]</code>의 load는 서로를 기다릴 필요가 없다. 논문은 다음 chain을 시작하는 방식을 세 가지로 평가하고(non-speculative, independent-early, predictive), 이 선택이 제때 도착하는 비율에 가장 큰 영향을 준다고 보고한다.</p>
+
+    <h3>논문이 보고한 결과</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>구성</th><th>추가 저장 공간</th><th class="number">MPKI 감소</th><th class="number">IPC 향상</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Core-Only</strong><br>실행 자원을 코어와 나눠 쓴다</td><td>9KB</td><td class="number">37.5%</td><td class="number">8.2%</td></tr>
+        <tr><td><strong>Mini</strong><br>작은 전용 엔진</td><td>17KB</td><td class="number">43.6%</td><td class="number">13.7%</td></tr>
+        <tr><td><strong>Big</strong><br>잠재력 확인용</td><td>제한 없음</td><td class="number">47.5%</td><td class="number">16.9%</td></tr>
+        <tr><td>비교: TAGE-SC-L을 80KB로 키움</td><td>16KB</td><td class="number">0.8%</td><td class="number">0.3%</td></tr>
+      </tbody>
+    </table></div>
+    <div class="callout evidence">
+      <strong>조건과 읽는 법</strong>
+      <p>모두 64KB TAGE-SC-L을 쓴 4-wide 코어 대비 평균이다(원문 Fig. 10). 대상은 SPEC CPU2006/2017 정수와 GAP에서 MPKI가 2보다 큰 17개 benchmark이므로, 분기 오예측이 적은 프로그램까지 포함한 평균이 아니다. 마지막 줄은 같은 저장 공간을 예측기에 더 주었을 때다. history 기반 예측기로는 이 분기들을 거의 줄이지 못한다는 것을 보여 주는 대조군이다.</p>
+    </div>
+
+    <h3>비용과 한계</h3>
+    <ul>
+      <li><strong>제때 도착하는 비율.</strong> 논문은 Dependence Chain Engine이 낸 예측 가운데 제때 만들어진 것이 약 40%라고 밝히고, timeliness를 가장 어려운 문제로 꼽는다. 실제로 쓰인 예측은 거의 다 옳았다. 문제는 정확도가 아니라 시간이다.</li>
+      <li><strong>출발이 늦다.</strong> chain은 오예측이 한 번 나야 입력값을 받아 출발한다. 그 전에는 결과를 낼 수 없다.</li>
+      <li><strong>chain의 제약.</strong> 제어 흐름과 store를 넣지 않으므로, 분기 사이의 의존이 복잡한 프로그램에서는 맡을 수 있는 분기가 줄어든다. 이 한계가 다음 절 TEA와 <a href="loop.html">7장</a> Phelps의 출발점이다.</li>
+      <li><strong>하드웨어.</strong> 전용 엔진의 면적은 0.38mm², 비순차 실행 코어의 약 2.2%로 추정했다(McPAT, 22nm).</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ 3 -->
+  <section id="tea">
+    <h2>TEA: 늦게 온 결과로 일찍 고친다</h2>
+    <div class="paper-card">
+      <span class="paper-title">Timely, Efficient, and Accurate Branch Precomputation (TEA)</span>
+      <span class="paper-meta">Aniket Deshmukh, Lingzhe (Chester) Cai, Yale N. Patt · MICRO 2024 · <a href="https://hps.ece.utexas.edu/pub/TEA.pdf" rel="noopener">원문</a></span>
+      <span class="paper-scope">평가 조건: baseline 64KB TAGE-SC-L, SPEC CPU2017과 GAP 중 MPKI 0.5 이상, 8-wide 비순차 실행 코어(ROB 512) · <b>근거 범위: 논문 전문</b></span>
+    </div>
+
+    <h3>문제: "fetch 전에 도착"이라는 기한이 모든 것을 묶는다</h3>
+    <p>Branch Runahead 방식은 결과로 예측을 <strong>덮어쓴다</strong>(override). 덮어쓰려면 결과가 fetch보다 먼저 와야 한다. TEA 논문은 이 기한 하나 때문에 세 가지를 포기하게 된다고 정리한다.</p>
+    <ul>
+      <li><strong>자주 늦는다.</strong> 기한을 맞추려고 제어 흐름이 단순한 분기만 고르게 되고, 그만큼 맡는 분기가 줄어든다.</li>
+      <li><strong>부정확해진다.</strong> 빨리 끝내려고 chain을 짧고 단순하게 만들면 틀린 결과가 나오고, 틀린 결과가 맞는 예측을 덮어쓰면 없던 오예측이 생긴다.</li>
+      <li><strong>비싸다.</strong> 늦거나 틀린 계산이 코어의 자원을 낭비하지 않게 하려고 별도의 코어나 전용 엔진을 둔다.</li>
+    </ul>
+
+    <h3>아이디어: 덮어쓰지 말고, 틀린 것을 일찍 알려 준다</h3>
+    <p>TEA는 기한을 바꾼다. 결과가 fetch에 늦었더라도 main의 그 분기가 execute를 마치기 전에만 오면 쓸모가 있다. 미리 계산한 방향이 예측과 다르면 main의 분기가 resolve될 때까지 기다리지 않고 그 자리에서 flush한다. 논문은 이를 <span class="term">early misprediction flush</span>라고 부른다.</p>
+    <p>이미 틀린 경로로 가 버린 시간은 되돌릴 수 없다. 하지만 원래의 resolve까지 계속되었을 낭비는 거기서 멈춘다.</p>
+    <div class="formula">
+      $$ \text{낭비되는 시간} = \min\bigl(\max(t_{\text{도착}},\ 0),\ t_{\text{resolve}}\bigr) $$
+      <div class="formula-note">분기를 fetch한 시각을 0으로 둔다. \(t_{\text{도착}}\)은 미리 계산한 결과가 나온 시각, \(t_{\text{resolve}}\)는 main의 분기가 원래 확인되는 시각이다. 결과가 fetch 전에 오면 낭비가 0이고, resolve보다 늦으면 baseline과 같다. 예측이 틀렸고 미리 계산한 결과는 옳은 경우의 식이다.</div>
+    </div>
+    <p>기한이 느슨해지면 나머지 둘도 풀린다. 급하지 않으니 복잡한 제어 흐름을 따라 더 길고 정확한 chain을 만들 수 있다. 계산이 정확하면 낭비가 적으니 전용 엔진 없이 코어의 자원을 그대로 쓸 수 있다.</p>
+    <p>구현의 핵심은 미리 계산하는 흐름(<span class="term">TEA thread</span>)이 main과 <strong>같은 분기 예측기</strong>를 따라간다는 점이다.</p>
+    <ul>
+      <li><strong>만들기.</strong> retire된 명령을 Fill Buffer에 모으고, H2P Table이 가려낸 어려운 분기에서 거꾸로 따라가 chain에 속한 명령에 표시를 한다. 표시된 명령만 basic block 단위로 묶어 <span class="term">Block Cache</span>에 저장한다.</li>
+      <li><strong>가져오기.</strong> 분기 예측기가 만든 fetch 주소는 main과 TEA thread 양쪽에 전달된다. main은 그 주소의 명령을 모두 가져오고, TEA thread는 Block Cache에서 chain에 속한 명령만 가져온다. 건너뛰는 명령이 많을수록 TEA thread가 앞서 나간다.</li>
+      <li><strong>실행.</strong> 두 흐름은 Issue 단계에서 만나 같은 실행 자원을 쓴다. TEA thread에 우선권을 주고, 활성 상태일 때 Reservation Station과 Physical Register를 192개씩 따로 떼어 둔다.</li>
+      <li><strong>고치기.</strong> 두 흐름이 같은 예측기를 따르므로 TEA thread의 분기와 main의 분기에 같은 순번(timestamp)을 붙일 수 있다. TEA thread의 분기가 예측과 다르게 끝나면, 그 순번보다 젊은 명령을 기존의 flush 장치로 버린다. 방향뿐 아니라 target도 같은 방식으로 고친다.</li>
+    </ul>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 392" role="img" aria-label="TEA의 구조. 분기 예측기의 fetch 주소가 main thread와 TEA thread에 함께 전달되고, 두 흐름은 Issue에서 만나 실행부를 나눠 쓴다. TEA thread의 분기 결과가 예측과 다르면 조기 flush한다.">
+        <defs>
+          <marker id="value-tea-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrow-head"/></marker>
+          <marker id="value-tea-arrow-flush" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="fill-mispredict"/></marker>
+        </defs>
+        <text x="430" y="26" text-anchor="middle" class="label-strong">✕ 조기 flush: TEA thread의 분기 결과가 예측과 다르면 main의 분기가 끝나기 전에 버린다</text>
+        <path d="M780 146 V40 H85 V146" class="stroke-mispredict" marker-end="url(#value-tea-arrow-flush)"/>
+        <text x="190" y="72" class="label-dim">main thread: 그 주소의 명령을 모두 가져온다</text>
+        <rect x="190" y="80" width="120" height="50" rx="9" class="fill-surface"/><text x="250" y="110" text-anchor="middle" class="label">Fetch Queue</text>
+        <rect x="325" y="80" width="130" height="50" rx="9" class="fill-surface"/><text x="390" y="110" text-anchor="middle" class="label">I-cache · Decode</text>
+        <rect x="470" y="80" width="130" height="50" rx="9" class="fill-surface"/><text x="535" y="110" text-anchor="middle" class="label">Rename</text>
+        <rect x="20" y="150" width="130" height="80" rx="9" class="fill-surface"/><text x="85" y="186" text-anchor="middle" class="label-strong">분기 예측기</text><text x="85" y="206" text-anchor="middle" class="label-dim">fetch 주소를 만든다</text>
+        <text x="190" y="242" class="label-accent">TEA thread: chain에 속한 명령만 가져온다</text>
+        <rect x="190" y="250" width="150" height="50" rx="9" class="fill-accent-soft"/><text x="265" y="280" text-anchor="middle" class="label">Shadow Fetch Queue</text>
+        <rect x="355" y="250" width="110" height="50" rx="9" class="fill-accent-soft"/><text x="410" y="280" text-anchor="middle" class="label-strong">Block Cache</text>
+        <rect x="480" y="250" width="120" height="50" rx="9" class="fill-accent-soft"/><text x="540" y="280" text-anchor="middle" class="label">Fetch · Rename</text>
+        <rect x="630" y="150" width="70" height="80" rx="9" class="fill-surface"/><text x="665" y="186" text-anchor="middle" class="label-strong">Issue</text><text x="665" y="206" text-anchor="middle" class="label-dim">TEA 우선</text>
+        <rect x="720" y="150" width="120" height="80" rx="9" class="fill-surface"/><text x="780" y="186" text-anchor="middle" class="label-strong">실행부</text><text x="780" y="206" text-anchor="middle" class="label-dim">자원을 나눠 쓴다</text>
+        <path d="M150 172 H170 V105 H186" class="stroke-line" marker-end="url(#value-tea-arrow)"/>
+        <path d="M150 208 H170 V275 H186" class="stroke-line" marker-end="url(#value-tea-arrow)"/>
+        <path d="M310 105 H321" class="stroke-line" marker-end="url(#value-tea-arrow)"/>
+        <path d="M455 105 H466" class="stroke-line" marker-end="url(#value-tea-arrow)"/>
+        <path d="M340 275 H351" class="stroke-line" marker-end="url(#value-tea-arrow)"/>
+        <path d="M465 275 H476" class="stroke-line" marker-end="url(#value-tea-arrow)"/>
+        <path d="M600 105 H665 V146" class="stroke-line" marker-end="url(#value-tea-arrow)"/>
+        <path d="M600 275 H665 V234" class="stroke-line" marker-end="url(#value-tea-arrow)"/>
+        <path d="M700 190 H716" class="stroke-line" marker-end="url(#value-tea-arrow)"/>
+        <path d="M780 230 V326" class="stroke-line" marker-end="url(#value-tea-arrow)"/>
+        <text x="790" y="285" class="label-dim">끝난 명령</text>
+        <rect x="640" y="330" width="200" height="44" rx="9" class="fill-accent-soft"/><text x="740" y="357" text-anchor="middle" class="label-strong">H2P Table · Fill Buffer</text>
+        <path d="M636 352 H410 V304" class="stroke-line" marker-end="url(#value-tea-arrow)"/>
+        <text x="523" y="344" text-anchor="middle" class="label-dim">chain에 속한 명령만 골라 저장</text>
+      </svg>
+      <figcaption><b>그림 5-3.</b> TEA thread를 만들고 가져오는 구조. 원문 Fig. 4를 다시 그렸다. 보라색 상자가 새로 더한 부분이고, 실행부는 새로 두지 않고 main과 나눠 쓴다. 빨간 선(✕)은 조기 flush의 경로다.</figcaption>
+    </figure>
+
+    <h3>동작 예시: 세 가지 정책의 낭비 시간</h3>
+    <p>예측이 틀린 분기 하나를 놓고, 미리 계산한 결과가 언제 도착하느냐에 따라 세 정책이 버리는 시간을 비교해 보자. 미리 계산한 결과가 틀리는 경우도 함께 본다. 예측은 맞았는데 틀린 결과가 끼어들면 없던 낭비가 생긴다.</p>
+
+    <div class="simulator" id="simulator-early">
+      <div class="simulator-head"><span class="simulator-tag">실험 3</span><h3>늦어도 쓸모 있다</h3></div>
+      <div class="simulator-body side">
+        <div class="simulator-view">
+          <div class="legend"><span><i style="background:var(--mispredict)"></i>✕ 버려지는 시간</span><span><i style="background:var(--surface-strong); box-shadow: 0 0 0 1px var(--border)"></i>쓸모 있는 실행</span><span><i class="line" style="background:var(--accent)"></i>helper 결과 도착</span></div>
+          <canvas id="early-canvas" data-height="300" aria-label="분기 하나의 fetch, helper 결과 도착, 원래 resolve 시각과, 세 정책에서 버려지는 시간"></canvas>
+        </div>
+        <div class="simulator-controls">
+          <div class="control"><span>이 분기에서 일어난 일</span><div class="segmented" id="early-scenario"><button data-value="predictor-wrong" class="on">예측이 틀림, helper는 옳음</button><button data-value="helper-wrong">예측은 맞음, helper가 틀림</button></div></div>
+          <label class="control"><span>helper 결과 도착 <output id="early-arrival-output"></output></span><input type="range" id="early-arrival" min="-10" max="65" step="1" value="12"></label>
+          <label class="control"><span>fetch에서 resolve까지 <output id="early-resolve-output"></output></span><input type="range" id="early-resolve" min="10" max="60" step="1" value="30"></label>
+          <label class="control"><span>helper 정확도 <output id="early-accuracy-output"></output></span><input type="range" id="early-accuracy" min="80" max="100" step="0.1" value="99"></label>
+          <label class="control"><span>이 분기의 오예측률 <output id="early-miss-output"></output></span><input type="range" id="early-miss" min="1" max="50" step="1" value="15"></label>
+        </div>
+      </div>
+      <div class="simulator-readout">
+        <div class="statistic"><span class="statistic-label">평균 낭비: baseline</span><span class="statistic-value" id="early-expected-baseline">—</span></div>
+        <div class="statistic"><span class="statistic-label">평균 낭비: override만</span><span class="statistic-value" id="early-expected-override">—</span></div>
+        <div class="statistic"><span class="statistic-label">평균 낭비: 조기 flush</span><span class="statistic-value" id="early-expected-flush">—</span></div>
+        <div class="statistic"><span class="statistic-label">잘못된 flush</span><span class="statistic-value" id="early-bad-flush">—</span></div>
+      </div>
+      <div class="simulator-note"><b>설명용 모델.</b> 위 그림은 선택한 경우 한 번의 시간축이고, 아래 수치는 이 분기를 여러 번 실행했을 때의 평균이다(오예측률과 helper 정확도를 곱해 네 경우를 합친다). flush 뒤 다시 채우는 시간은 세 정책에 똑같이 들므로 뺐다. cycle 값은 논문의 측정치가 아니다. <b>해 볼 것.</b> 도착 시각을 0과 resolve 사이에서 움직이면 조기 flush만 낭비가 줄어든다. resolve 뒤로 넘기면 세 정책이 같아진다. helper 정확도를 80%로, 오예측률을 5%로 내리면 조기 flush가 baseline보다 나빠진다. 맞는 예측을 망치는 횟수가 고치는 횟수보다 많아지기 때문이다.</div>
+    </div>
+    <p>마지막 조작이 알려 주는 것은 TEA의 이름에 Accurate가 들어간 이유다. 조기 flush는 미리 계산한 결과를 믿고 main을 버리는 일이므로, 결과가 틀리면 손해가 그대로 돌아온다. 그리고 예측기가 이미 잘 맞히는 분기에 붙이면 고칠 것은 적고 망칠 것만 많다. 그래서 TEA도 H2P Table로 어려운 분기만 고른다.</p>
+    <p>논문의 설계에는 틀린 결과를 걸러 내는 장치가 둘 있다. main의 분기가 실제로 끝날 때 다시 확인해서, TEA thread가 틀렸으면 flush를 한 번 더 낸다. 또 main의 명령 흐름을 보고 chain이 놓친 의존 관계가 드러나면, 그 뒤의 TEA 분기가 flush를 내지 못하게 미리 막는다. 논문은 이렇게 해서 추가 flush가 명령 1,000개당 0.001번 아래로 내려간다고 보고한다.</p>
+
+    <h3>논문이 보고한 결과</h3>
+    <div class="callout evidence">
+      <strong>논문이 보고한 값 (원문 Fig. 5와 본문)</strong>
+      <p>64KB TAGE-SC-L을 쓴 8-wide 코어 대비 성능 향상의 기하평균은 10.1%다. 대상은 SPEC CPU2017과 GAP 가운데 MPKI가 0.5 이상인 benchmark다. TEA thread를 main과 자원을 나누지 않는 별도 실행 엔진에서 돌리면 12.3%가 된다. 미리 계산한 분기의 99.3%가 옳았고, 약 76%가 오예측 손실을 1 cycle 이상 줄였다(논문은 이 76%를 misprediction coverage로도 적는다). 같은 baseline에 저자들이 다시 구현한 Branch Runahead(전용 엔진 사용)는 7.3%였다.</p>
+    </div>
+
+    <h3>비용과 한계</h3>
+    <ul>
+      <li><strong>더 실행하는 명령.</strong> 가져오는 동적 명령 수가 baseline보다 31.9% 늘어난다.</li>
+      <li><strong>자원 경쟁.</strong> TEA thread에 우선권을 주므로 main의 일부 명령은 실행이 늦어진다. 논문은 어려운 분기가 대체로 실행의 critical path에 있어 그래도 이득이라고 설명한다.</li>
+      <li><strong>면적과 전력.</strong> 코어 면적 약 3.5%, 최대 전력 8.5% 증가로 추정했다(McPAT). 실행 시간이 줄고 틀린 경로의 fetch가 줄어 전체 에너지는 2% 감소한다고 보고한다.</li>
+      <li><strong>단순한 루프에서는.</strong> 제어 흐름이 단순한 benchmark에서는 Branch Runahead가 비슷하게 나온다. TEA thread는 예측기가 fetch 주소를 내줄 때까지 기다려야 해서 분기 하나당 줄이는 시간이 조금 작고, 대신 더 많은 분기를 맡는다고 논문은 설명한다.</li>
+      <li><strong>평가 범위.</strong> SPEC CPU2017과 GAP에 대한 결과다. 코드가 큰 서버 프로그램에서의 결과는 논문에 없다.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ 4 -->
+  <section id="runlts">
+    <h2>RUNLTS: 이미 나온 register 값을 읽는다</h2>
+    <div class="paper-card">
+      <span class="paper-title">RUNLTS: Register-value-aware Predictor Utilizing Nested Large Tables</span>
+      <span class="paper-meta">Toru Koizumi, Toshiki Maekawa, Masanari Mizuno, Maru Kuroki, Tomoaki Tsumura, Ryota Shioya · CBP2025 (1위) 공개판 · 확장판은 ISCA 2026 · <a href="https://ericrotenberg.wordpress.ncsu.edu/files/2025/06/cbp2025-final44-Koizumi.pdf" rel="noopener">원문(CBP2025 공개판)</a></span>
+      <span class="paper-scope">평가 조건: CBP2025 simulator(fetch 폭 16, frontend 깊이 10), training trace 105개의 뒤쪽 절반, 저장 예산 192 KiB, baseline은 저자가 조정한 192 KiB TAGE-SC-L · <b>근거 범위: CBP2025 공개판 전문. ISCA 2026 확장판의 수치는 따로 표시한다</b></span>
+    </div>
+
+    <h3>문제: 계산을 따라가지 않고 값을 쓸 수는 없을까</h3>
+    <p>앞의 두 논문은 값을 얻으려고 명령을 더 실행한다. 어려운 분기를 가려내고, 값을 만드는 명령을 추적하고, 그것을 실행할 자원을 마련해야 한다. RUNLTS는 다른 질문을 한다. 프로그램이 평소대로 실행하면서 <strong>이미 register에 써 놓은 값</strong> 중에 분기 방향과 관련된 것이 있지 않을까.</p>
+    <p>이 값은 분기가 직접 비교하는 값이 아니어도 된다. 어떤 register든, 그 값의 특징과 분기 방향 사이에 통계적 관계만 있으면 단서가 된다. 논문은 이를 register 값과 분기 방향의 <span class="term">상관</span><span class="english">(register-value correlation)</span>이라고 부르고, 의존 관계를 추적하지 않고 그 상관을 직접 배운다.</p>
+    <div class="callout caution">
+      <strong>"값을 쓴다"는 말의 뜻</strong>
+      <p>미래의 값을 미리 안다는 뜻이 아니다. 예측하는 순간에 <strong>이미 계산이 끝나 있는</strong> 값만 읽는다. 논문도 분기 앞 약 100개 명령 안에서 만들어진 값은 예측 시점에 보기 어렵다고 적는다. 그래서 실험 1의 <code>v = A[i]</code>처럼 분기 바로 앞에서 읽는 값은 대개 이 방법으로 볼 수 없다. 대신 논문은 두 경우를 든다. 값을 만든 명령이 충분히 멀리 있을 때, 그리고 오예측 직후다. 오예측이 밝혀질 무렵에는 실행 중이던 명령이 많이 끝나 있어서, 다시 출발하는 예측기가 볼 수 있는 값이 늘어난다. 논문은 이 덕분에 연달아 나는 오예측을 두 번째부터 고칠 수 있다고 설명한다.</p>
+    </div>
+
+    <h3>아이디어: 값을 12-bit digest로 줄여 기존 보정기에 더한다</h3>
+    <p>64-bit 값을 그대로 표의 색인으로 쓸 수는 없다. RUNLTS는 값마다 12-bit짜리 <span class="term">digest</span>(요약값)를 만든다. 정수 register의 digest는 세 가지 재료로 만든다. 맨 위에서 0 또는 1이 연달아 나오는 개수, 맨 아래에서 0 또는 1이 연달아 나오는 개수, 그리고 가장 아래 6 bit다. 논문은 이 방식이 주소와 "딱 떨어지는 수"의 특징을 잘 잡는다고 설명한다. 부동소수점 register는 부호와 지수의 위쪽 bit를, 조건 flag는 4 bit를 세 번 반복해 쓴다.</p>
+    <p>digest가 지금 유효한지는 작은 표 하나로 관리한다. logical register마다 한 칸이고, 칸에는 valid bit와 digest가 들어간다.</p>
+    <ul>
+      <li>register에 값을 쓰는 명령이 decode되면 그 칸의 valid를 끈다. 아직 값이 없기 때문이다.</li>
+      <li>그 명령이 실행을 마치면 결과값의 digest를 적고 valid를 켠다.</li>
+      <li>분기를 예측할 때는 valid가 켜진 칸의 digest만 예측기로 보낸다.</li>
+      <li>너무 오래된 digest는 정확도를 떨어뜨리므로, 그 뒤로 명령 256개가 decode되면 무효로 한다.</li>
+    </ul>
+    <p>digest를 받는 쪽은 TAGE-SC-L의 <span class="term">Statistical Corrector</span>다. 이 보정기는 여러 성분이 낸 점수를 더해, 합의 부호와 크기에 따라 TAGE의 예측을 유지하거나 뒤집는다. RUNLTS는 여기에 register 값 성분(<code>sR</code>)을 하나 더한다. logical register를 여덟 bank로 나누고, bank마다 두 종류의 표를 둔다.</p>
+    <ul>
+      <li><strong>UT(usefulness 표).</strong> 분기 주소로 찾는다. 그 bank의 register 각각이 이 분기에 얼마나 쓸모 있었는지를 담는다. 지금 유효한 register 가운데 점수가 가장 높은 하나를 고른다.</li>
+      <li><strong>WT(weight 표).</strong> 고른 register의 digest와 분기 주소로 찾는다. taken 쪽인지 not-taken 쪽인지에 대한 점수가 나온다.</li>
+    </ul>
+    <p>bank마다 register 하나만 고르는 것은 표를 읽는 통로를 늘리지 않기 위해서다. 학습할 때도 예측 시점에 유효했던 register만 대상으로 하고, 한 bank에서 여럿이 유효했으면 그중 하나를 무작위로 골라 갱신한다.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 376" role="img" aria-label="RUNLTS의 register 값 성분. Digest 표에서 유효한 digest를 읽고, usefulness 표가 고른 register의 digest로 weight 표를 찾아 점수 sR을 만든 뒤 기존 성분의 점수와 더한다.">
+        <defs><marker id="value-runlts-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrow-head"/></marker></defs>
+        <text x="20" y="24" class="label-strong">값 성분의 bank 하나 (bank는 모두 8개, 각각 logical register 8–9개를 맡는다)</text>
+        <text x="20" y="48" class="label-dim">명령이 끝나면 결과값의 12-bit digest를 적는다</text>
+        <rect x="20" y="58" width="220" height="30" rx="6" class="fill-accent-soft"/><text x="130" y="78" text-anchor="middle" class="label-strong">Digest 표 (register당 한 칸)</text>
+        <rect x="20" y="88" width="220" height="28" class="fill-elevated"/><text x="34" y="107" class="label-mono">R0</text><text x="92" y="107" class="label">유효</text><text x="170" y="107" class="label-mono">0xA40</text>
+        <rect x="20" y="116" width="220" height="28" class="fill-elevated"/><text x="34" y="135" class="label-mono">R8</text><text x="92" y="135" class="label-dim">계산 중</text><text x="170" y="135" class="label-dim">읽지 않음</text>
+        <rect x="20" y="144" width="220" height="28" class="fill-elevated"/><text x="34" y="163" class="label-mono">R16</text><text x="92" y="163" class="label">유효</text><text x="170" y="163" class="label-mono">0x03F</text>
+        <rect x="20" y="172" width="220" height="28" class="fill-elevated"/><text x="34" y="191" class="label-mono">…</text>
+        <text x="20" y="222" class="label-dim">예측 시점에 유효한 칸만 읽는다</text>
+        <rect x="290" y="58" width="190" height="58" rx="9" class="fill-accent-soft"/><text x="385" y="82" text-anchor="middle" class="label-strong">UT (usefulness 표)</text><text x="385" y="102" text-anchor="middle" class="label-dim">register마다 쓸모 점수</text>
+        <path d="M560 87 H484" class="stroke-line" marker-end="url(#value-runlts-arrow)"/><text x="568" y="91" class="label-dim">분기 주소로 조회</text>
+        <rect x="290" y="146" width="190" height="58" rx="9" class="fill-surface"/><text x="385" y="170" text-anchor="middle" class="label-strong">선택</text><text x="385" y="190" text-anchor="middle" class="label-dim">점수가 가장 높은 것 하나</text>
+        <path d="M385 116 V142" class="stroke-line" marker-end="url(#value-runlts-arrow)"/>
+        <path d="M240 175 H286" class="stroke-line" marker-end="url(#value-runlts-arrow)"/>
+        <rect x="530" y="130" width="190" height="90" rx="9" class="fill-accent-soft"/><text x="625" y="156" text-anchor="middle" class="label-strong">WT 세 개 (방향 점수)</text><text x="625" y="178" text-anchor="middle" class="label-dim">512칸, 256칸, 128칸</text><text x="625" y="198" text-anchor="middle" class="label-dim">분기 주소와 digest로 조회</text>
+        <path d="M480 175 H526" class="stroke-line" marker-end="url(#value-runlts-arrow)"/>
+        <circle cx="785" cy="175" r="24" class="fill-elevated"/><text x="785" y="181" text-anchor="middle" class="label-strong">Σ</text>
+        <path d="M720 175 H757" class="stroke-line" marker-end="url(#value-runlts-arrow)"/>
+        <text x="785" y="138" text-anchor="middle" class="label-dim">× 0 또는 × 2.5</text>
+        <path d="M785 199 V258" class="stroke-line" marker-end="url(#value-runlts-arrow)"/>
+        <rect x="725" y="262" width="120" height="58" rx="9" class="fill-accent-soft"/><text x="785" y="286" text-anchor="middle" class="label-strong">sR</text><text x="785" y="306" text-anchor="middle" class="label-dim">값 성분의 점수</text>
+        <rect x="290" y="262" width="330" height="58" rx="9" class="fill-surface"/><text x="455" y="286" text-anchor="middle" class="label-strong">기존 성분의 점수</text><text x="455" y="306" text-anchor="middle" class="label-dim">bias, 여러 history, IMLI, call stack</text>
+        <text x="672" y="297" text-anchor="middle" class="label-strong">+</text>
+        <path d="M290 334 H845" class="stroke-line"/>
+        <text x="567" y="358" text-anchor="middle" class="label">모두 더한 값의 부호와 크기로 TAGE의 예측을 유지하거나 뒤집는다</text>
+        <text x="20" y="266" class="label-strong">학습</text>
+        <text x="20" y="288" class="label-dim">실제 방향이 나오면,</text>
+        <text x="20" y="306" class="label-dim">예측 때 유효했던 register에</text>
+        <text x="20" y="324" class="label-dim">대해서만 표를 갱신한다</text>
+      </svg>
+      <figcaption><b>그림 5-4.</b> RUNLTS의 register 값 성분. CBP2025 공개판의 Fig. 5(c)를 다시 그렸다. 보라색 상자가 새로 더한 부분이다. 표의 크기와 "× 0 또는 × 2.5"는 공개판 그림에 적힌 값이고, digest 값 0xA40과 0x03F는 설명용 예다.</figcaption>
+    </figure>
+
+    <h3>동작 예시: 값 성분을 켜고 끄기, digest 만들어 보기</h3>
+    <p>아래 실험은 두 부분이다. (가)는 history가 매번 똑같아서 history로는 구별할 수 없는 분기에, register 값 성분을 붙였다 떼었다 해 본다. (나)는 64-bit 값을 직접 고쳐 가며 digest가 어떻게 만들어지는지, 그리고 서로 다른 값이 같은 digest가 되는 경우를 본다.</p>
+
+    <div class="simulator" id="simulator-digest">
+      <div class="simulator-head"><span class="simulator-tag">실험 4</span><h3>register 값의 digest</h3></div>
+      <div class="simulator-tabs"><div class="segmented" id="digest-part"><button data-value="correlation" class="on">가. 값 성분을 켜고 끄기</button><button data-value="explorer">나. digest 만들어 보기</button></div></div>
+
+      <div id="digest-correlation-panel">
+        <div class="simulator-body side">
+          <div class="simulator-view">
+            <div class="legend"><span><i class="line" style="background:var(--series-1)"></i>history 성분만</span><span><i class="line" style="background:var(--series-2)"></i>history + register 값 성분</span></div>
+            <canvas id="digest-canvas" aria-label="history 성분만 쓴 보정기와 register 값 성분을 더한 보정기의 정확도 변화, register별 쓸모 점수, digest별 가중치"></canvas>
+          </div>
+          <div class="simulator-controls">
+            <label class="check"><input type="checkbox" id="digest-enable" checked> register 값 성분 사용</label>
+            <label class="control"><span>값과 방향의 상관 세기 <output id="digest-strength-output"></output></span><input type="range" id="digest-strength" min="50" max="100" step="1" value="95"></label>
+            <label class="control"><span>예측 때 R1이 준비된 비율 <output id="digest-ready-output"></output></span><input type="range" id="digest-ready" min="0" max="100" step="5" value="90"></label>
+          </div>
+        </div>
+        <div class="simulator-readout">
+          <div class="statistic"><span class="statistic-label">history 성분만</span><span class="statistic-value" id="digest-history-accuracy">—</span></div>
+          <div class="statistic"><span class="statistic-label">register 값 성분 포함</span><span class="statistic-value" id="digest-value-accuracy">—</span></div>
+          <div class="statistic"><span class="statistic-label">값 성분이 더한 정확도</span><span class="statistic-value" id="digest-gain">—</span></div>
+          <div class="statistic"><span class="statistic-label">가장 많이 쓰인 register</span><span class="statistic-value" id="digest-selected">—</span></div>
+        </div>
+      </div>
+
+      <div id="digest-explorer-panel" hidden>
+        <div class="simulator-body">
+          <div class="simulator-view padded">
+            <div class="legend"><span><i style="background:var(--series-4)"></i>맨 위에서 같은 bit가 이어지는 구간</span><span><i style="background:var(--series-3)"></i>맨 아래에서 이어지는 구간</span><span><i style="background:transparent; box-shadow: 0 0 0 2px var(--series-2)"></i>하위 6 bit</span></div>
+            <div class="bit-editor">
+              <div class="bit-value">
+                <label class="control"><span>값 A (16진수, 16자리까지)</span><input class="hex-input" id="digest-first-input" type="text" maxlength="16" spellcheck="false" autocomplete="off"></label>
+                <div class="bit-grid" id="digest-first-grid"></div>
+                <div class="digest-breakdown" id="digest-first-breakdown"></div>
+              </div>
+              <div class="bit-value">
+                <label class="control"><span>값 B (16진수, 16자리까지)</span><input class="hex-input" id="digest-second-input" type="text" maxlength="16" spellcheck="false" autocomplete="off"></label>
+                <div class="bit-grid" id="digest-second-grid"></div>
+                <div class="digest-breakdown" id="digest-second-breakdown"></div>
+              </div>
+            </div>
+            <p class="bit-grid-caption" style="padding: 10px 4px 0">칸을 누르면 그 bit가 뒤집힌다. 왼쪽 위가 bit 63, 오른쪽 아래가 bit 0이다.</p>
+          </div>
+          <div class="simulator-controls inline">
+            <div class="control"><span>예시 불러오기</span><div class="control-row"><button class="button" id="digest-preset-threshold">4,160과 8,000</button><button class="button" id="digest-preset-pointer">서로 다른 두 포인터</button><button class="button" id="digest-preset-small">작은 수 5와 6</button><button class="button" id="digest-preset-sign">0과 −1</button></div></div>
+          </div>
+        </div>
+        <div class="simulator-readout">
+          <div class="statistic"><span class="statistic-label">A의 digest</span><span class="statistic-value" id="digest-first-result">—</span></div>
+          <div class="statistic"><span class="statistic-label">B의 digest</span><span class="statistic-value" id="digest-second-result">—</span></div>
+          <div class="statistic"><span class="statistic-label">판정</span><span class="statistic-value" id="digest-verdict">—</span></div>
+          <div class="statistic"><span class="statistic-label">digest 하나에 대응하는 값</span><span class="statistic-value">2<sup>52</sup><small>개 (평균)</small></span></div>
+        </div>
+      </div>
+
+      <div class="simulator-note"><b>설명용 모델.</b> (가) 분기 하나를 3,000번 실행한다. 직전 history는 매번 같다. R1에는 네 종류의 값(0, 1, −1, 64바이트로 정렬된 포인터) 가운데 하나가 들어 있고, 분기 방향은 그 종류를 따른다(0과 −1이면 taken 쪽, 1과 포인터면 not-taken 쪽). R2에는 방향과 무관한 값이, R3에는 루프 카운터가 들어 있다. 보정기는 작은 perceptron 방식의 가중치 표이고, register별 쓸모 점수는 "그 register의 표가 최근에 방향을 맞힌 비율"로 단순화했다(58%를 넘어야 쓰인다). 실제 RUNLTS의 표 크기, hash, 점수 갱신 규칙과 다르다. 수치는 후반 1,500번의 평균이다. (나) 위쪽 6 bit는 "두 구간 길이의 XOR", 아래쪽 6 bit는 값의 하위 6 bit로 만들었다. 공개판은 세 재료만 밝히므로 bit를 묶는 세부는 이 실험의 가정이다. <b>해 볼 것.</b> (가)에서 "준비된 비율"을 0%로 내리면 값 성분이 있어도 쓸 수 없다. 상관 세기를 55% 아래로 내리면 쓸모 점수가 문턱을 넘지 못해 값 성분이 꺼진 것과 같아진다. (나)에서 4,160과 8,000은 digest가 같다. 가운데 bit를 눌러도 digest가 그대로인지 확인해 보자.</div>
+    </div>
+    <p>(가)에서 history 성분만 쓴 보정기는 50% 근처에 머문다. history가 매번 같으니 배울 수 있는 것은 "어느 쪽이 조금 더 많은가"뿐이다. 값 성분을 켜면 R1의 digest별 가중치가 한쪽으로 자라고, R1의 쓸모 점수가 올라가 선택된다. 방향과 무관한 R2와 루프 카운터 R3의 점수는 50% 근처에 머물러 선택되지 않는다. 어떤 register가 쓸모 있는지 미리 알려 주지 않아도 된다는 점이 이 구조의 요점이다.</p>
+    <p>(나)는 digest가 무엇을 버리는지 보여 준다. 4,160과 8,000은 맨 위의 0이 51개, 맨 아래의 0이 6개, 하위 6 bit가 모두 0으로 같아서 같은 digest가 된다. 값의 "모양"은 남고 정확한 크기는 사라진다. 64-bit 값은 2<sup>64</sup>가지이고 digest는 2<sup>12</sup>가지뿐이므로 충돌은 피할 수 없다. 반면 5와 6처럼 작은 수는 하위 6 bit가 달라 정확히 구별된다. 0, −1, 정렬된 주소처럼 프로그램에서 뜻이 다른 값들도 서로 다른 digest가 된다.</p>
+
+    <h3>논문이 보고한 결과 (CBP2025 공개판)</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>예측기</th><th>저장 공간</th><th class="number">MPKI</th><th class="number">틀린 경로 cycle (명령 1,000개당)</th></tr></thead>
+      <tbody>
+        <tr><td>TAGE-SC-L</td><td>64 KiB</td><td class="number">3.751</td><td class="number">152.5</td></tr>
+        <tr><td>TAGE-SC-L, 저자가 조정 (baseline)</td><td>192 KiB</td><td class="number">3.408</td><td class="number">145.2</td></tr>
+        <tr><td>RUNLTS, local history 성분 제외</td><td>192 KiB</td><td class="number">3.269</td><td class="number">141.5</td></tr>
+        <tr><td><strong>RUNLTS</strong></td><td>192 KiB</td><td class="number">3.197</td><td class="number">140.3</td></tr>
+      </tbody>
+    </table></div>
+    <div class="callout evidence">
+      <strong>조건과 읽는 법 (공개판 Table 1, Fig. 7, Table 3)</strong>
+      <p>CBP2025가 제공한 training trace 105개의 평균이다. trace마다 앞쪽 절반으로 예측기를 데우고 뒤쪽 절반을 쟀다. Fig. 7은 기능을 하나씩 뺐을 때의 MPKI 차이를 쌓아 보여 주는데, 논문은 register 값 성분(sR)의 이득이 가장 크고 모든 trace 범주에서 나타났다고 적는다. RUNLTS는 105개 가운데 7개를 뺀 모든 trace에서 baseline보다 정확했다. 값 성분의 저장 공간은 53,863 bit(약 6.6 KiB)이고 전체는 191.75 KiB다.</p>
+    </div>
+    <div class="callout caution">
+      <strong>이 수치를 읽을 때 조심할 점</strong>
+      <p>3.408에서 3.197로 내려간 것이 모두 register 값의 효과는 아니다. RUNLTS는 값 성분 외에 history 길이를 고르는 새 방법, 할당량 조절, IMLI 성분 강화, call stack 기반 history도 함께 넣었다. 또 이것은 CBP trace에 대한 <strong>예측 정확도</strong> 평가다. 이 MPKI를 SPEC이나 GAP에서의 IPC 향상으로 바꿔 읽을 수 없고, 앞의 두 논문의 성능 수치와 나란히 놓을 수도 없다.</p>
+    </div>
+    <div class="callout evidence">
+      <strong>ISCA 2026 확장판이 보고한 값 (공개판과 다른 평가)</strong>
+      <p>확장판 "RUNLTS: Branch Prediction with Register-Value Correlations and Hierarchical Table Orchestration"은 값 성분을 RBias라고 부르고, flush 뒤의 복구 방식과 평가를 보강했다. 192 KiB TAGE-SC-L 대비 CBP2025 trace 673개에서 MPKI 5.00% 감소, gem5로 돌린 SPEC CPU2017(16-wide)에서 IPC 1.55% 향상을 보고한다(checkpoint로 복구하는 구성 기준). 이 값들은 위 표의 105개 trace 결과와 평가 집합과 구성이 다르므로 섞어서 계산하지 않는다.</p>
+    </div>
+
+    <h3>비용과 한계</h3>
+    <ul>
+      <li><strong>값이 준비되어 있어야 한다.</strong> 분기 바로 앞에서 만들어지는 값은 예측 시점에 볼 수 없다. 실험 4(가)의 "준비된 비율"이 그 조건이다.</li>
+      <li><strong>digest는 모양만 남긴다.</strong> 크기 비교의 경계가 digest가 같은 두 값 사이에 있으면 구별하지 못한다.</li>
+      <li><strong>구현에서 남은 일.</strong> 공개판은 실행부에서 예측기로 digest를 보내는 경로와, flush 때 digest 표를 되돌리는 방법을 향후 과제로 남긴다. 확장판이 복구 방식을 다룬다.</li>
+      <li><strong>평가 범위.</strong> 공개판은 trace 기반의 정확도 평가다. 코어 성능과 에너지는 확장판에서 따로 다룬다.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ 5 -->
+  <section id="comparison">
+    <h2>세 논문 비교: 어떤 정보가, 언제까지 와야 하는가</h2>
+    <p>세 논문은 모두 history 밖의 정보를 쓰지만, 그 정보가 도착해야 하는 기한이 다르다. 기한이 기법의 성격을 정한다. 기한이 빠듯할수록 맡을 수 있는 분기가 줄고, 기한이 느슨할수록 한 번에 얻는 이득이 작아진다.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 290" role="img" aria-label="분기 하나를 기준으로 세 논문의 정보가 도착해야 하는 기한. RUNLTS는 값이 이미 써져 있어야 하고, Branch Runahead는 fetch 전, TEA는 resolve 전이다.">
+        <defs><marker id="value-timing-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrow-head"/></marker></defs>
+        <text x="20" y="26" class="label-strong">같은 분기 하나를 놓고 본, 정보가 도착해야 하는 기한</text>
+        <text x="470" y="52" text-anchor="middle" class="label-accent">fetch: 방향을 고른다</text>
+        <text x="760" y="52" text-anchor="middle" class="label-accent">resolve: 답이 나온다</text>
+        <text x="20" y="97" class="label-strong">RUNLTS</text>
+        <rect x="170" y="74" width="300" height="36" rx="8" class="fill-accent-soft"/><text x="320" y="97" text-anchor="middle" class="label">값이 이미 써져 있어야 한다</text>
+        <text x="482" y="97" class="label-dim">예측할 때 읽기만 한다</text>
+        <text x="20" y="153" class="label-strong">Branch Runahead</text>
+        <rect x="170" y="130" width="300" height="36" rx="8" class="fill-accent-soft"/><text x="320" y="153" text-anchor="middle" class="label">chain 결과가 여기까지 도착</text>
+        <text x="482" y="153" class="label-dim">늦으면 그 예측에는 못 쓴다</text>
+        <text x="20" y="209" class="label-strong">TEA</text>
+        <rect x="170" y="186" width="590" height="36" rx="8" class="fill-accent-soft"/><text x="320" y="209" text-anchor="middle" class="label">여기서 오면 가장 좋고</text><text x="615" y="209" text-anchor="middle" class="label">여기서 와도 조기 flush</text>
+        <path d="M470 60 V238" class="stroke-dashed"/>
+        <path d="M760 60 V238" class="stroke-dashed"/>
+        <path d="M170 252 H836" class="stroke-line" marker-end="url(#value-timing-arrow)"/>
+        <text x="503" y="276" text-anchor="middle" class="label-dim">시간은 왼쪽에서 오른쪽으로 흐른다. 막대는 정보가 도착하면 쓸 수 있는 구간이다.</text>
+      </svg>
+      <figcaption><b>그림 5-5.</b> 정보가 도착해야 하는 기한. RUNLTS는 프로그램이 스스로 써 둔 값을 읽고, 나머지 둘은 helper가 계산해 낸 결과를 기다린다. TEA는 fetch 뒤의 구간까지 쓴다.</figcaption>
+    </figure>
+    <div class="table-wrap"><table>
+      <thead><tr><th>논문</th><th>쓰는 정보</th><th>도착 기한</th><th>더한 하드웨어</th><th>보고한 결과와 조건</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Branch Runahead</strong><br>MICRO 2021</td>
+          <td>dependence chain을 따로 실행해 얻은 분기 방향</td>
+          <td>fetch 전. 늦으면 그 예측에는 쓰지 못한다</td>
+          <td>Hard Branch Table, Chain Extraction Buffer, chain 저장소, Dependence Chain Engine, prediction queue. Mini 구성 17KB</td>
+          <td>Mini 구성에서 MPKI 43.6% 감소, IPC 13.7% 향상. 64KB TAGE-SC-L, 4-wide, SPEC CPU2006/2017 정수와 GAP 중 MPKI가 2보다 큰 17개</td>
+        </tr>
+        <tr>
+          <td><strong>TEA</strong><br>MICRO 2024</td>
+          <td>같은 예측기를 따라가는 thread가 미리 계산한 방향과 target</td>
+          <td>resolve 전. fetch 뒤에 와도 조기 flush에 쓴다</td>
+          <td>H2P Table, Fill Buffer(8KB), Block Cache(19KB), TEA용 fetch와 rename 단계. 실행 자원은 main과 공유</td>
+          <td>성능 10.1% 향상(기하평균). 동적 명령 31.9% 증가. 64KB TAGE-SC-L, 8-wide, SPEC CPU2017과 GAP 중 MPKI 0.5 이상</td>
+        </tr>
+        <tr>
+          <td><strong>RUNLTS</strong><br>CBP2025 공개판</td>
+          <td>예측 시점에 이미 logical register에 써진 값의 12-bit digest</td>
+          <td>기다리지 않는다. 예측할 때 유효한 것만 읽는다</td>
+          <td>register당 한 칸의 digest 표, usefulness 표와 weight 표(값 성분 약 6.6 KiB). 추가로 실행하는 명령은 없다</td>
+          <td>MPKI 3.408에서 3.197로. 192 KiB 예산, CBP2025 training trace 105개. 정확도 평가이며 IPC 수치가 아니다</td>
+        </tr>
+      </tbody>
+    </table></div>
+    <div class="callout caution">
+      <strong>세 줄을 순위로 읽지 않는다</strong>
+      <p>마지막 칸의 숫자는 지표도, baseline도, workload도, 코어도 서로 다르다. Branch Runahead와 TEA는 둘 다 SPEC과 GAP을 쓰지만 benchmark를 고른 기준(MPKI 2 초과와 0.5 이상)과 코어 폭(4-wide와 8-wide)이 다르다. 같은 조건의 비교는 TEA 논문 안에 있는 것 하나뿐이다(같은 8-wide baseline에서 TEA 10.1%, 다시 구현한 Branch Runahead 7.3%).</p>
+    </div>
+    <p>세 방법은 서로를 대신하지 않는다. 값이 분기 바로 앞에서 만들어지면 RUNLTS는 볼 수 없고 선행 계산이 필요하다. 반대로 값이 오래전에 만들어져 있다면 명령을 더 실행하지 않고도 단서를 얻는다. 루프 안의 어려운 분기들이 서로 얽혀 있으면 이 장의 chain만으로는 부족하다. 그 경우는 <a href="loop.html">7장</a>에서 다룬다.</p>
+  </section>
+
+  <section id="summary" class="keypoints">
+    <h2>핵심 정리</h2>
+    <ol>
+      <li>방향이 방금 읽은 값에 달려 있고 그 값들이 서로 무관하면, 방향 history에는 답이 없다. 예측기를 키워도 "다수 방향만 찍기"를 넘기 어렵다.</li>
+      <li>Branch Runahead는 분기를 계산하는 dependence chain만 뽑아 전용 엔진에서 먼저 실행하고, 결과를 prediction queue에 넣어 예측을 덮어쓴다. 결과가 fetch 전에 와야 하며, 논문은 제때 만들어진 예측이 약 40%라고 밝힌다.</li>
+      <li>TEA는 기한을 "예측 전"에서 "실행 전"으로 늦춘다. 미리 계산한 결과가 예측과 다르면 일찍 flush해서 남은 낭비를 줄인다. 대신 계산이 정확해야 하고, 코어의 자원을 main과 나눠 쓴다.</li>
+      <li>RUNLTS는 명령을 더 실행하지 않는다. 예측 시점에 이미 register에 써진 값을 12-bit digest로 줄여 Statistical Corrector의 한 성분으로 더한다. 미래의 값을 아는 것이 아니다.</li>
+      <li>digest는 값의 모양을 남기고 정확한 크기를 버린다. 서로 다른 값이 같은 digest가 될 수 있다.</li>
+      <li>세 논문의 수치는 지표와 조건이 다르다. RUNLTS의 MPKI는 CBP trace의 정확도 평가이고, 공개판과 ISCA 2026 확장판의 수치도 서로 섞지 않는다.</li>
+    </ol>
+  </section>
+
+  <section id="quiz">
+    <h2>확인 퀴즈</h2>
+    <div class="quiz" id="chapter-quiz"></div>
+  </section>
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ============================================================ 실험 1: 값이 결정하는 분기 */
+  (function setupValueExperiment() {
+    const ARRAY_LENGTH = 2400;
+    const VALUE_MAXIMUM = 100;
+    const WINDOW_LENGTH = 32;
+    const BRANCH_ADDRESS = 0x4a0;
+    const PERIODIC_VALUES = [12, 71, 33, 90, 55, 8, 64, 41];
+    const SKEW_EXPONENT = 4;
+    // 주기 8인 데이터가 일부 값만 찍히지 않도록, 8과 서로소인 간격으로 점을 고른다.
+    const SCATTER_STEP = 3;
+    const SCATTER_RADIUS = 1.7;
+    const GSHARE_OPTIONS = { indexBits: 12, historyLength: 12 };
+    const TAGE_OPTIONS = { historyLengths: [4, 8, 16, 32] };
+    const INITIAL_SEED = 5;
+    const COIN_FLIP_ACCURACY = 0.5;
+    let seed = INITIAL_SEED;
+    let state = null;
+    let valueChart = null;
+    let accuracyRegions = [];
+
+    function buildValues(distribution) {
+      const random = BranchBook.createRandom(seed);
+      const values = [];
+      for (let elementIndex = 0; elementIndex < ARRAY_LENGTH; elementIndex++) {
+        const draw = random();
+        let value = draw * VALUE_MAXIMUM;
+        if (distribution === "skewed") value = VALUE_MAXIMUM * Math.pow(draw, SKEW_EXPONENT);
+        if (distribution === "periodic") value = PERIODIC_VALUES[elementIndex % PERIODIC_VALUES.length];
+        values.push(value);
+      }
+      if (distribution === "sorted") values.sort((first, second) => first - second);
+      return values;
+    }
+    /** 결과열에 보일 구간을 고른다. 방향이 바뀌는 곳이 있으면 배열 가운데에서 가장 가까운 그곳을 보여 준다. */
+    function findWindowStart(trace) {
+      const middle = Math.floor(ARRAY_LENGTH / 2);
+      let center = middle;
+      let hasFoundChange = false;
+      for (let offset = 0; offset < middle - 1 && !hasFoundChange; offset++) {
+        const after = middle + offset;
+        const before = middle - offset;
+        if (trace[after].taken !== trace[after + 1].taken) { center = after + 1; hasFoundChange = true; }
+        else if (trace[before].taken !== trace[before - 1].taken) { center = before; hasFoundChange = true; }
+      }
+      return BranchBook.clamp(center - WINDOW_LENGTH / 2, 0, ARRAY_LENGTH - WINDOW_LENGTH);
+    }
+    function compute() {
+      const threshold = thresholdControl.value;
+      const values = buildValues(distributionControl.value);
+      const trace = values.map((value) => ({ address: BRANCH_ADDRESS, taken: value > threshold }));
+      const takenFraction = trace.filter((branch) => branch.taken).length / ARRAY_LENGTH;
+      const gshareResult = BranchBook.runPredictor(BranchBook.predictors.createGshare(GSHARE_OPTIONS), trace);
+      const tageResult = BranchBook.runPredictor(BranchBook.predictors.createTage(TAGE_OPTIONS), trace);
+      return {
+        threshold, values, trace, takenFraction,
+        majorityAccuracy: Math.max(takenFraction, 1 - takenFraction),
+        gshareAccuracy: gshareResult.accuracy,
+        tageAccuracy: tageResult.accuracy,
+        tageIsCorrectList: tageResult.isCorrectList,
+        windowStart: findWindowStart(trace),
+      };
+    }
+    function refresh() {
+      state = compute();
+      const windowOutcomes = [];
+      for (let offset = 0; offset < WINDOW_LENGTH; offset++) {
+        const elementIndex = state.windowStart + offset;
+        windowOutcomes.push({
+          taken: state.trace[elementIndex].taken,
+          isMispredicted: state.tageIsCorrectList[elementIndex] === 0,
+          title: "i = " + elementIndex + ", A[i] = " + state.values[elementIndex].toFixed(1),
+        });
+      }
+      BranchBook.renderOutcomeStrip("value-strip", windowOutcomes);
+      BranchBook.setContent("value-window-label", "i = " + state.windowStart + "부터 " + WINDOW_LENGTH + "개의 방향");
+      BranchBook.setContent("value-taken-share", BranchBook.formatPercent(state.takenFraction, 0));
+      BranchBook.setContent("value-majority", BranchBook.formatPercent(state.majorityAccuracy));
+      BranchBook.setContent("value-gshare", BranchBook.formatPercent(state.gshareAccuracy));
+      BranchBook.setContent("value-tage", BranchBook.formatPercent(state.tageAccuracy));
+      valueCanvas.redraw();
+      accuracyCanvas.redraw();
+    }
+    const distributionControl = BranchBook.bindSegmented("value-distribution", refresh);
+    const thresholdControl = BranchBook.bindRange("value-threshold", (value) => String(value), refresh);
+    BranchBook.bindButton("value-reseed", () => { seed += 1; refresh(); });
+
+    const valueCanvas = BranchBook.createCanvas("value-canvas", (context, width, height, palette) => {
+      if (!state) return;
+      const chart = BranchBook.drawChart(context, { x: 56, y: 12, width: width - 70, height: height - 62 }, {
+        xMinimum: 0, xMaximum: ARRAY_LENGTH, yMinimum: 0, yMaximum: VALUE_MAXIMUM,
+        xTicks: 4, yTicks: 4, xLabel: "배열 위치 i", yLabel: "값 A[i]",
+        xFormat: (value) => String(Math.round(value)), yFormat: (value) => String(Math.round(value)),
+      });
+      valueChart = chart;
+      const windowLeft = chart.toX(state.windowStart);
+      const windowWidth = Math.max(4, chart.toX(state.windowStart + WINDOW_LENGTH) - windowLeft);
+      context.fillStyle = palette.accentSoft;
+      context.fillRect(windowLeft, chart.bounds.y, windowWidth, chart.bounds.height);
+      context.strokeStyle = palette.accent; context.lineWidth = 1;
+      context.strokeRect(windowLeft + 0.5, chart.bounds.y + 0.5, windowWidth, chart.bounds.height - 1);
+      for (let elementIndex = 0; elementIndex < ARRAY_LENGTH; elementIndex += SCATTER_STEP) {
+        const value = state.values[elementIndex];
+        context.fillStyle = value > state.threshold ? palette.taken : palette.notTaken;
+        context.beginPath();
+        context.arc(chart.toX(elementIndex), chart.toY(value), SCATTER_RADIUS, 0, Math.PI * 2);
+        context.fill();
+      }
+      const thresholdY = Math.round(chart.toY(state.threshold)) + 0.5;
+      context.strokeStyle = palette.text; context.lineWidth = 1.5; context.setLineDash([6, 4]);
+      context.beginPath(); context.moveTo(chart.bounds.x, thresholdY); context.lineTo(chart.bounds.x + chart.bounds.width, thresholdY); context.stroke();
+      context.setLineDash([]);
+      // 선 위에 여유가 없으면 라벨을 선 아래에 둔다.
+      const isLabelBelow = thresholdY < chart.bounds.y + 22;
+      context.font = "600 12px " + palette.font; context.textAlign = "right";
+      context.textBaseline = isLabelBelow ? "top" : "bottom";
+      const labelText = "threshold = " + state.threshold;
+      const labelWidth = context.measureText(labelText).width;
+      const labelX = chart.bounds.x + chart.bounds.width - 6;
+      const labelY = thresholdY + (isLabelBelow ? 5 : -5);
+      context.fillStyle = palette.background; context.globalAlpha = 0.85;
+      context.fillRect(labelX - labelWidth - 4, isLabelBelow ? labelY - 1 : labelY - 15, labelWidth + 8, 17);
+      context.globalAlpha = 1;
+      context.fillStyle = palette.text;
+      context.fillText(labelText, labelX, labelY);
+    });
+    BranchBook.attachTooltip("value-canvas", (x, y) => {
+      if (!valueChart || !state) return null;
+      const bounds = valueChart.bounds;
+      if (x < bounds.x || x > bounds.x + bounds.width || y < bounds.y || y > bounds.y + bounds.height) return null;
+      const elementIndex = BranchBook.clamp(Math.round(((x - bounds.x) / bounds.width) * ARRAY_LENGTH), 0, ARRAY_LENGTH - 1);
+      const value = state.values[elementIndex];
+      const directionText = value > state.threshold ? "taken" : "not-taken";
+      return { x: valueChart.toX(elementIndex), y: valueChart.toY(value), html: "i = <b>" + elementIndex + "</b> · A[i] = <b>" + value.toFixed(1) + "</b> · " + directionText };
+    });
+
+    const accuracyCanvas = BranchBook.createCanvas("value-accuracy-canvas", (context, width, height, palette) => {
+      if (!state) return;
+      const bars = [
+        { label: "다수 방향만 찍기", value: state.majorityAccuracy, color: palette.textFaint },
+        { label: "gshare", value: state.gshareAccuracy, color: palette.series[0] },
+        { label: "TAGE", value: state.tageAccuracy, color: palette.series[1] },
+      ];
+      const labelWidth = 106;
+      const valueWidth = 56;
+      const barHeight = 22;
+      const rowGap = 12;
+      const chartLeft = labelWidth + 12;
+      const chartWidth = width - chartLeft - valueWidth - 6;
+      const top = 10;
+      accuracyRegions = [];
+      context.textBaseline = "middle";
+      bars.forEach((bar, barIndex) => {
+        const y = top + barIndex * (barHeight + rowGap);
+        context.fillStyle = palette.surface;
+        BranchBook.roundedRectangle(context, chartLeft, y, chartWidth, barHeight, 4); context.fill();
+        context.fillStyle = bar.color;
+        BranchBook.roundedRectangle(context, chartLeft, y, Math.max(4, chartWidth * bar.value), barHeight, 4); context.fill();
+        context.fillStyle = palette.text; context.font = "13px " + palette.font; context.textAlign = "right";
+        context.fillText(bar.label, labelWidth, y + barHeight / 2);
+        context.font = "600 13px " + palette.mono; context.textAlign = "left";
+        context.fillText(BranchBook.formatPercent(bar.value), chartLeft + chartWidth + 8, y + barHeight / 2);
+        accuracyRegions.push({ x: chartLeft, y, width: chartWidth, height: barHeight, bar });
+      });
+      const barsBottom = top + bars.length * (barHeight + rowGap) - rowGap;
+      const coinFlipX = Math.round(chartLeft + chartWidth * COIN_FLIP_ACCURACY) + 0.5;
+      context.strokeStyle = palette.text; context.lineWidth = 1; context.setLineDash([4, 4]);
+      context.beginPath(); context.moveTo(coinFlipX, top - 4); context.lineTo(coinFlipX, barsBottom + 6); context.stroke();
+      context.setLineDash([]);
+      context.fillStyle = palette.textDim; context.font = "12px " + palette.font; context.textBaseline = "top";
+      context.textAlign = "center";
+      context.fillText("50% (동전 던지기)", coinFlipX, barsBottom + 10);
+      context.textAlign = "left";
+      context.fillText("0%", chartLeft, barsBottom + 10);
+      context.textAlign = "right";
+      context.fillText("100%", chartLeft + chartWidth, barsBottom + 10);
+    });
+    BranchBook.attachTooltip("value-accuracy-canvas", (x, y) => {
+      const region = accuracyRegions.find((candidate) => y >= candidate.y && y <= candidate.y + candidate.height && x >= candidate.x && x <= candidate.x + candidate.width);
+      if (!region) return null;
+      const mispredictionCount = Math.round((1 - region.bar.value) * ARRAY_LENGTH);
+      return { x, y: region.y, html: region.bar.label + " <b>" + BranchBook.formatPercent(region.bar.value, 2) + "</b> · " + ARRAY_LENGTH + "번 중 <b>" + mispredictionCount + "</b>번 틀림" };
+    });
+    refresh();
+  })();
+
+  /* ============================================================ 실험 2: helper와 main의 경주 */
+  (function setupRaceExperiment() {
+    const ITERATION_COUNT = 48;
+    const FETCH_WIDTH = 4;
+    const MISPREDICTION_PENALTY = 14;
+    const QUEUE_CAPACITY = 8;
+    const PREDICTOR_MISS_RATE = 0.3;
+    const INITIATION_INTERVAL = 1;
+    const RANDOM_SEED = 23;
+    const CHART_TOP = 14;
+    const STRIP_AREA_HEIGHT = 96;
+    const STRIP_OFFSET = 56;
+    const STRIP_CELL_HEIGHT = 16;
+    const STRIP_LABEL_INTERVAL = 12;
+    const TIME_TICK_COUNT = 5;
+    const TICK_STEP_CHOICES = [20, 40, 50, 100, 150, 200, 300, 400];
+    const STATUS_TIMELY = "timely";
+    const STATUS_LATE_CORRECT = "lateCorrect";
+    const STATUS_LATE_MISPREDICTED = "lateMispredicted";
+    const STATUS_TEXTS = {
+      timely: "제때 도착. helper의 결과를 썼다",
+      lateCorrect: "늦음. 예측기가 맞혔다",
+      lateMispredicted: "✕ 늦음. 예측기도 틀렸다",
+    };
+    const random = BranchBook.createRandom(RANDOM_SEED);
+    // 예측기가 혼자서 틀릴 반복을 미리 정해 둔다. 슬라이더를 움직여도 같은 반복에서 틀려야 설정끼리 비교가 된다.
+    const isPredictorWrongList = Array.from({ length: ITERATION_COUNT }, () => random() < PREDICTOR_MISS_RATE);
+    let state = null;
+    let raceChart = null;
+    let stripGeometry = null;
+
+    function simulate() {
+      const iterationCycles = bodyControl.value / FETCH_WIDTH;
+      // chain의 명령은 앞 명령의 결과를 받아 차례로 실행된다고 본다. 그중 load 하나만 여러 cycle이 걸린다.
+      const chainCycles = chainControl.value - 1 + latencyControl.value;
+      const isOverlapped = startControl.value === "overlapped";
+      const mainFetchTimes = [0];
+      const baselineFetchTimes = [0];
+      const helperStartTimes = [];
+      const helperDoneTimes = [];
+      const statuses = [];
+      for (let iterationIndex = 0; iterationIndex < ITERATION_COUNT; iterationIndex++) {
+        // queue가 꽉 차면, main이 오래된 칸을 꺼내 쓸 때까지 helper는 더 앞서 나가지 못한다.
+        let queueReadyTime = 0;
+        if (iterationIndex >= QUEUE_CAPACITY) queueReadyTime = mainFetchTimes[iterationIndex - QUEUE_CAPACITY];
+        let ownReadyTime = 0;
+        if (iterationIndex > 0 && isOverlapped) ownReadyTime = helperStartTimes[iterationIndex - 1] + INITIATION_INTERVAL;
+        if (iterationIndex > 0 && !isOverlapped) ownReadyTime = helperDoneTimes[iterationIndex - 1];
+        const helperStartTime = Math.max(ownReadyTime, queueReadyTime);
+        const helperDoneTime = helperStartTime + chainCycles;
+        helperStartTimes.push(helperStartTime);
+        helperDoneTimes.push(helperDoneTime);
+        const isTimely = helperDoneTime <= mainFetchTimes[iterationIndex];
+        const isPredictorWrong = isPredictorWrongList[iterationIndex];
+        let status = STATUS_TIMELY;
+        if (!isTimely) status = isPredictorWrong ? STATUS_LATE_MISPREDICTED : STATUS_LATE_CORRECT;
+        statuses.push(status);
+        const mainPenalty = status === STATUS_LATE_MISPREDICTED ? MISPREDICTION_PENALTY : 0;
+        mainFetchTimes.push(mainFetchTimes[iterationIndex] + iterationCycles + mainPenalty);
+        const baselinePenalty = isPredictorWrong ? MISPREDICTION_PENALTY : 0;
+        baselineFetchTimes.push(baselineFetchTimes[iterationIndex] + iterationCycles + baselinePenalty);
+      }
+      return {
+        iterationCycles, chainCycles, mainFetchTimes, baselineFetchTimes, helperDoneTimes, statuses,
+        timelyCount: statuses.filter((status) => status === STATUS_TIMELY).length,
+        mispredictionCount: statuses.filter((status) => status === STATUS_LATE_MISPREDICTED).length,
+        baselineMispredictionCount: isPredictorWrongList.filter((isWrong) => isWrong).length,
+        totalCycles: mainFetchTimes[ITERATION_COUNT],
+        baselineCycles: baselineFetchTimes[ITERATION_COUNT],
+      };
+    }
+    function refresh() {
+      state = simulate();
+      BranchBook.setContent("race-main-pace", BranchBook.formatNumber(state.iterationCycles) + "<small>cycle</small>");
+      BranchBook.setContent("race-helper-pace", state.chainCycles + "<small>cycle</small>");
+      BranchBook.setContent("race-coverage", BranchBook.formatPercent(state.timelyCount / ITERATION_COUNT, 0) + "<small>" + state.timelyCount + " / " + ITERATION_COUNT + "</small>");
+      BranchBook.setContent("race-mispredictions", state.baselineMispredictionCount + " → " + state.mispredictionCount);
+      const timeChange = state.totalCycles / state.baselineCycles - 1;
+      const timeChangeText = timeChange === 0 ? "변화 없음" : BranchBook.formatPercent(timeChange);
+      BranchBook.setContent("race-time", timeChangeText + "<small>" + Math.round(state.baselineCycles) + " → " + Math.round(state.totalCycles) + " cycle</small>");
+      raceCanvas.redraw();
+    }
+    const bodyControl = BranchBook.bindRange("race-body", (value) => "명령 " + value + "개", refresh);
+    const chainControl = BranchBook.bindRange("race-chain", (value) => "micro-op " + value + "개", refresh);
+    const latencyControl = BranchBook.bindRange("race-latency", (value) => value + " cycle", refresh);
+    const startControl = BranchBook.bindSegmented("race-start", refresh);
+
+    const raceCanvas = BranchBook.createCanvas("race-canvas", (context, width, height, palette) => {
+      if (!state) return;
+      const bounds = { x: 56, y: CHART_TOP, width: width - 72, height: height - CHART_TOP - STRIP_AREA_HEIGHT };
+      const longestCycles = Math.max(state.totalCycles, state.baselineCycles);
+      let tickStep = TICK_STEP_CHOICES[TICK_STEP_CHOICES.length - 1];
+      for (let choiceIndex = TICK_STEP_CHOICES.length - 1; choiceIndex >= 0; choiceIndex--) {
+        if (TICK_STEP_CHOICES[choiceIndex] * TIME_TICK_COUNT >= longestCycles) tickStep = TICK_STEP_CHOICES[choiceIndex];
+      }
+      const chart = BranchBook.drawChart(context, bounds, {
+        xMinimum: 0, xMaximum: tickStep * TIME_TICK_COUNT, yMinimum: 0, yMaximum: ITERATION_COUNT,
+        xTicks: TIME_TICK_COUNT, yTicks: 4, xLabel: "시간 (cycle)", yLabel: "도달한 반복 번호",
+        xFormat: (value) => String(Math.round(value)), yFormat: (value) => String(Math.round(value)),
+      });
+      raceChart = chart;
+      const baselinePoints = state.baselineFetchTimes.map((time, iterationIndex) => [time, iterationIndex]);
+      const mainPoints = state.mainFetchTimes.map((time, iterationIndex) => [time, iterationIndex]);
+      const helperPoints = state.helperDoneTimes.map((time, iterationIndex) => [time, iterationIndex]);
+      BranchBook.drawLine(context, chart, baselinePoints, palette.textFaint, { dashed: true, lineWidth: 1.5 });
+      BranchBook.drawLine(context, chart, helperPoints, palette.series[1], { lineWidth: 2.5 });
+      BranchBook.drawLine(context, chart, mainPoints, palette.series[0], { lineWidth: 2.5 });
+
+      // 아래 띠: 반복마다 helper의 결과가 main의 fetch보다 먼저 왔는지.
+      const stripTop = bounds.y + bounds.height + STRIP_OFFSET;
+      const cellWidth = bounds.width / ITERATION_COUNT;
+      stripGeometry = { left: bounds.x, top: stripTop, cellWidth, height: STRIP_CELL_HEIGHT };
+      state.statuses.forEach((status, iterationIndex) => {
+        const cellX = bounds.x + iterationIndex * cellWidth;
+        let cellColor = palette.series[1];
+        if (status === STATUS_LATE_CORRECT) cellColor = palette.surfaceStrong;
+        if (status === STATUS_LATE_MISPREDICTED) cellColor = palette.mispredict;
+        context.fillStyle = cellColor;
+        context.fillRect(cellX + 0.5, stripTop, Math.max(1, cellWidth - 1), STRIP_CELL_HEIGHT);
+        if (status === STATUS_LATE_MISPREDICTED) {
+          const crossSize = Math.min(4, cellWidth / 2 - 1.5);
+          const centerX = cellX + cellWidth / 2;
+          const centerY = stripTop + STRIP_CELL_HEIGHT / 2;
+          context.strokeStyle = "#ffffff"; context.lineWidth = 1.5;
+          context.beginPath();
+          context.moveTo(centerX - crossSize, centerY - crossSize); context.lineTo(centerX + crossSize, centerY + crossSize);
+          context.moveTo(centerX + crossSize, centerY - crossSize); context.lineTo(centerX - crossSize, centerY + crossSize);
+          context.stroke();
+        }
+      });
+      context.fillStyle = palette.textDim; context.font = "12px " + palette.font;
+      context.textAlign = "right"; context.textBaseline = "middle";
+      context.fillText("반복별", bounds.x - 8, stripTop + STRIP_CELL_HEIGHT / 2);
+      context.font = "11px " + palette.mono; context.textAlign = "center"; context.textBaseline = "top";
+      for (let iterationIndex = 0; iterationIndex < ITERATION_COUNT; iterationIndex += STRIP_LABEL_INTERVAL) {
+        context.fillText(String(iterationIndex), bounds.x + (iterationIndex + 0.5) * cellWidth, stripTop + STRIP_CELL_HEIGHT + 5);
+      }
+    });
+    BranchBook.attachTooltip("race-canvas", (x, y) => {
+      if (!raceChart || !stripGeometry || !state) return null;
+      const bounds = raceChart.bounds;
+      let iterationIndex = -1;
+      const isInsideStrip = y >= stripGeometry.top - 4 && y <= stripGeometry.top + stripGeometry.height + 4 && x >= bounds.x && x <= bounds.x + bounds.width;
+      const isInsideChart = y >= bounds.y && y <= bounds.y + bounds.height && x >= bounds.x && x <= bounds.x + bounds.width;
+      if (isInsideStrip) iterationIndex = Math.floor((x - stripGeometry.left) / stripGeometry.cellWidth);
+      if (isInsideChart) iterationIndex = Math.round(((bounds.y + bounds.height - y) / bounds.height) * ITERATION_COUNT);
+      if (iterationIndex < 0 || iterationIndex >= ITERATION_COUNT) return null;
+      const slack = state.mainFetchTimes[iterationIndex] - state.helperDoneTimes[iterationIndex];
+      const slackText = slack >= 0 ? "여유 <b>" + Math.round(slack) + "</b> cycle" : "<b>" + Math.round(-slack) + "</b> cycle 늦음";
+      const anchorY = isInsideStrip ? stripGeometry.top : raceChart.toY(iterationIndex);
+      return {
+        x, y: anchorY,
+        html: "반복 <b>" + iterationIndex + "</b> · main fetch <b>" + Math.round(state.mainFetchTimes[iterationIndex]) + "</b> · helper 결과 <b>" + Math.round(state.helperDoneTimes[iterationIndex]) + "</b><br>" + slackText + " · " + STATUS_TEXTS[state.statuses[iterationIndex]],
+      };
+    });
+    refresh();
+  })();
+
+  /* ============================================================ 실험 3: 늦어도 쓸모 있다 */
+  (function setupEarlyFlushExperiment() {
+    const TIME_MINIMUM = -12;
+    const TIME_MARGIN_AFTER_RESOLVE = 8;
+    const TIME_TICK_INTERVAL = 10;
+    const SCENARIO_PREDICTOR_WRONG = "predictor-wrong";
+    const ROWS_TOP = 50;
+    const ROW_PITCH = 64;
+    const ROW_LABEL_OFFSET = 10;
+    const BAR_OFFSET = 20;
+    const BAR_HEIGHT = 26;
+    const BAR_RADIUS = 5;
+    const SIDE_PADDING = 16;
+    const HATCH_SPACING = 8;
+    const HATCH_OPACITY = 0.35;
+    const MARKER_LABEL_HALF_WIDTH = 52;
+    const POLICIES = [
+      { id: "baseline", label: "baseline", detail: "resolve에서야 flush" },
+      { id: "override", label: "override만", detail: "fetch 전에 온 결과만 쓴다" },
+      { id: "early", label: "조기 flush", detail: "resolve 전에 오면 쓴다" },
+    ];
+    let rowRegions = [];
+
+    /** 선택한 경우 한 번에 대해, 정책 하나가 버리는 시간과 flush 시각, 설명을 구한다. */
+    function evaluatePolicy(policyId, scenario, arrivalTime, resolveTime) {
+      const isBeforeFetch = arrivalTime <= 0;
+      const isBeforeResolve = arrivalTime < resolveTime;
+      if (scenario === SCENARIO_PREDICTOR_WRONG) {
+        if (policyId === "override" && isBeforeFetch) return { wastedCycles: 0, flushTimes: [], note: "결과가 fetch 전에 와서 처음부터 올바른 방향으로 갔다." };
+        if (policyId === "override") return { wastedCycles: resolveTime, flushTimes: [resolveTime], note: "결과가 fetch보다 늦어 쓰지 못했다. baseline과 같다." };
+        if (policyId === "early" && isBeforeFetch) return { wastedCycles: 0, flushTimes: [], note: "main의 분기가 아직 frontend에 있을 때 고쳤다." };
+        if (policyId === "early" && isBeforeResolve) return { wastedCycles: arrivalTime, flushTimes: [arrivalTime], note: "결과가 오자마자 flush했다. resolve보다 " + (resolveTime - arrivalTime) + " cycle 이르다." };
+        if (policyId === "early") return { wastedCycles: resolveTime, flushTimes: [resolveTime], note: "결과가 resolve보다 늦었다. baseline과 같다." };
+        return { wastedCycles: resolveTime, flushTimes: [resolveTime], note: "resolve에서야 오예측을 안다." };
+      }
+      if (policyId === "override" && isBeforeFetch) return { wastedCycles: resolveTime, flushTimes: [resolveTime], note: "틀린 결과가 맞는 예측을 덮어썼다. resolve에서야 바로잡는다." };
+      if (policyId === "override") return { wastedCycles: 0, flushTimes: [], note: "결과가 fetch보다 늦어 쓰이지 않았다. 해도 없다." };
+      if (policyId === "early" && isBeforeResolve) return { wastedCycles: resolveTime, flushTimes: [Math.max(arrivalTime, 0), resolveTime], note: "틀린 결과를 믿고 flush했다. 그때까지 한 올바른 일을 버리고, resolve에서 한 번 더 flush한다." };
+      if (policyId === "early") return { wastedCycles: 0, flushTimes: [], note: "결과가 resolve보다 늦어 쓰이지 않았다. 해도 없다." };
+      return { wastedCycles: 0, flushTimes: [], note: "예측이 맞았으므로 버릴 것이 없다." };
+    }
+    /** 이 분기를 여러 번 실행했을 때의 평균 낭비. 예측이 맞고 틀린 경우와 helper가 맞고 틀린 경우를 모두 합친다. */
+    function computeExpectedWaste() {
+      const arrivalTime = arrivalControl.value;
+      const resolveTime = resolveControl.value;
+      const missRate = missControl.value / 100;
+      const helperAccuracy = accuracyControl.value / 100;
+      const baseline = missRate * resolveTime;
+      let override = baseline;
+      // 덮어쓰기가 성립하면 예측기의 실수는 사라지고, helper가 틀린 횟수만큼만 낭비가 남는다.
+      if (arrivalTime <= 0) override = (1 - helperAccuracy) * resolveTime;
+      let early = baseline;
+      let badFlushRate = 0;
+      if (arrivalTime < resolveTime) {
+        const correctedWaste = BranchBook.clamp(arrivalTime, 0, resolveTime);
+        badFlushRate = (1 - missRate) * (1 - helperAccuracy);
+        early = missRate * (helperAccuracy * correctedWaste + (1 - helperAccuracy) * resolveTime) + badFlushRate * resolveTime;
+      }
+      return { baseline, override, early, badFlushRate };
+    }
+    function refresh() {
+      const expected = computeExpectedWaste();
+      BranchBook.setContent("early-expected-baseline", expected.baseline.toFixed(2) + "<small>cycle/분기</small>");
+      BranchBook.setContent("early-expected-override", expected.override.toFixed(2) + "<small>cycle/분기</small>");
+      BranchBook.setContent("early-expected-flush", expected.early.toFixed(2) + "<small>cycle/분기</small>");
+      BranchBook.setContent("early-bad-flush", BranchBook.formatPercent(expected.badFlushRate, 2) + "<small>실행 중</small>");
+      earlyCanvas.redraw();
+    }
+    function formatArrival(value) {
+      if (value < 0) return "fetch " + -value + " cycle 전";
+      if (value === 0) return "fetch와 동시";
+      return "fetch " + value + " cycle 뒤";
+    }
+    const scenarioControl = BranchBook.bindSegmented("early-scenario", refresh);
+    const arrivalControl = BranchBook.bindRange("early-arrival", formatArrival, refresh);
+    const resolveControl = BranchBook.bindRange("early-resolve", (value) => value + " cycle", refresh);
+    const accuracyControl = BranchBook.bindRange("early-accuracy", (value) => value.toFixed(1) + "%", refresh);
+    const missControl = BranchBook.bindRange("early-miss", (value) => value + "%", refresh);
+
+    function fillHatched(context, x, y, width, height, fillColor) {
+      context.save();
+      BranchBook.roundedRectangle(context, x, y, width, height, BAR_RADIUS);
+      context.fillStyle = fillColor;
+      context.fill();
+      context.clip();
+      context.strokeStyle = "#ffffff"; context.lineWidth = 1.5; context.globalAlpha = HATCH_OPACITY;
+      for (let offset = -height; offset < width; offset += HATCH_SPACING) {
+        context.beginPath(); context.moveTo(x + offset, y + height); context.lineTo(x + offset + height, y); context.stroke();
+      }
+      context.restore();
+    }
+    const earlyCanvas = BranchBook.createCanvas("early-canvas", (context, width, height, palette) => {
+      const arrivalTime = arrivalControl.value;
+      const resolveTime = resolveControl.value;
+      const scenario = scenarioControl.value;
+      const timeMaximum = resolveTime + TIME_MARGIN_AFTER_RESOLVE;
+      const left = SIDE_PADDING;
+      const right = width - SIDE_PADDING;
+      const toX = (time) => left + ((time - TIME_MINIMUM) / (timeMaximum - TIME_MINIMUM)) * (right - left);
+      const rowsBottom = ROWS_TOP + POLICIES.length * ROW_PITCH - 8;
+      rowRegions = [];
+      POLICIES.forEach((policy, policyIndex) => {
+        const rowTop = ROWS_TOP + policyIndex * ROW_PITCH;
+        const barTop = rowTop + BAR_OFFSET;
+        const result = evaluatePolicy(policy.id, scenario, arrivalTime, resolveTime);
+        context.fillStyle = palette.text; context.font = "600 13px " + palette.font; context.textAlign = "left"; context.textBaseline = "middle";
+        context.fillText(policy.label, left, rowTop + ROW_LABEL_OFFSET);
+        const labelWidth = context.measureText(policy.label).width;
+        if (width > 430) {
+          context.fillStyle = palette.textDim; context.font = "12px " + palette.font;
+          context.fillText(policy.detail, left + labelWidth + 10, rowTop + ROW_LABEL_OFFSET);
+        }
+        context.textAlign = "right"; context.font = "600 13px " + palette.mono;
+        context.fillStyle = result.wastedCycles > 0 ? palette.mispredict : palette.text;
+        const wasteText = result.wastedCycles > 0 ? "✕ 낭비 " + result.wastedCycles + " cycle" : "낭비 0 cycle";
+        context.fillText(wasteText, right, rowTop + ROW_LABEL_OFFSET);
+        // 바탕: fetch 전은 비워 두고, fetch 뒤는 쓸모 있는 실행으로 칠한 다음 버려지는 구간을 덮는다.
+        context.fillStyle = palette.surface;
+        BranchBook.roundedRectangle(context, left, barTop, right - left, BAR_HEIGHT, BAR_RADIUS); context.fill();
+        context.fillStyle = palette.surfaceStrong;
+        BranchBook.roundedRectangle(context, toX(0), barTop, right - toX(0), BAR_HEIGHT, BAR_RADIUS); context.fill();
+        if (result.wastedCycles > 0) fillHatched(context, toX(0), barTop, toX(result.wastedCycles) - toX(0), BAR_HEIGHT, palette.mispredict);
+        result.flushTimes.forEach((flushTime) => {
+          const flushX = Math.round(toX(flushTime));
+          context.fillStyle = palette.text;
+          context.fillRect(flushX - 1.5, barTop - 3, 3, BAR_HEIGHT + 6);
+        });
+        rowRegions.push({ top: rowTop, bottom: rowTop + ROW_PITCH - 8, anchorY: barTop, policy, result });
+      });
+      // 세 시각을 세로선으로 표시한다. helper 선만 색을 달리해 슬라이더로 움직이는 대상임을 드러낸다.
+      const markers = [
+        { time: 0, label: "fetch", color: palette.text, labelY: 12, isDashed: false },
+        { time: resolveTime, label: "원래 resolve", color: palette.text, labelY: 12, isDashed: true },
+        { time: arrivalTime, label: "helper 결과 도착", color: palette.accent, labelY: 30, isDashed: false },
+      ];
+      markers.forEach((marker) => {
+        const markerX = Math.round(toX(marker.time)) + 0.5;
+        context.strokeStyle = marker.color; context.lineWidth = marker.color === palette.accent ? 2 : 1.5;
+        context.setLineDash(marker.isDashed ? [5, 4] : []);
+        context.beginPath(); context.moveTo(markerX, marker.labelY + 8); context.lineTo(markerX, rowsBottom + 4); context.stroke();
+        context.setLineDash([]);
+        context.fillStyle = marker.color; context.font = "600 12px " + palette.font; context.textAlign = "center"; context.textBaseline = "middle";
+        context.fillText(marker.label, BranchBook.clamp(markerX, MARKER_LABEL_HALF_WIDTH, width - MARKER_LABEL_HALF_WIDTH), marker.labelY);
+      });
+      context.fillStyle = palette.textDim; context.font = "11px " + palette.mono; context.textAlign = "center"; context.textBaseline = "top";
+      const tickInterval = timeMaximum - TIME_MINIMUM > 50 && width < 420 ? TIME_TICK_INTERVAL * 2 : TIME_TICK_INTERVAL;
+      for (let tickTime = -TIME_TICK_INTERVAL; tickTime <= timeMaximum; tickTime += tickInterval) {
+        context.fillText(String(tickTime), toX(tickTime), rowsBottom + 10);
+      }
+      context.font = "12px " + palette.font;
+      context.fillText("fetch를 0으로 둔 시각 (cycle)", width / 2, rowsBottom + 28);
+    }, { height: ROWS_TOP + POLICIES.length * ROW_PITCH + 44 });
+    BranchBook.attachTooltip("early-canvas", (x, y) => {
+      const region = rowRegions.find((candidate) => y >= candidate.top && y <= candidate.bottom);
+      if (!region) return null;
+      return { x, y: region.anchorY, html: "<b>" + region.policy.label + "</b> · 낭비 <b>" + region.result.wastedCycles + "</b> cycle<br>" + region.result.note };
+    });
+    refresh();
+  })();
+
+  /* ============================================================ 실험 4: register 값의 digest */
+  (function setupDigestExperiment() {
+    const VALUE_BIT_COUNT = 64;
+    const LOW_BIT_COUNT = 6;
+    const DIGEST_FIELD_MASK = 63;
+    const HEX_DIGIT_COUNT = 16;
+    const DIGEST_HEX_DIGIT_COUNT = 3;
+    const VALUE_MASK = (1n << BigInt(VALUE_BIT_COUNT)) - 1n;
+
+    /**
+     * 64-bit 값의 digest와 그 재료를 구한다.
+     * 위쪽 6 bit는 "맨 위에서 같은 bit가 이어진 길이"와 "맨 아래에서 이어진 길이"의 XOR, 아래쪽 6 bit는 값의 하위 6 bit다.
+     */
+    function describeValue(value) {
+      const bits = (value & VALUE_MASK).toString(2).padStart(VALUE_BIT_COUNT, "0");
+      const lastPosition = VALUE_BIT_COUNT - 1;
+      let leadingRunLength = 1;
+      while (leadingRunLength < VALUE_BIT_COUNT && bits[leadingRunLength] === bits[0]) leadingRunLength++;
+      let trailingRunLength = 1;
+      while (trailingRunLength < VALUE_BIT_COUNT && bits[lastPosition - trailingRunLength] === bits[lastPosition]) trailingRunLength++;
+      const lowBits = parseInt(bits.slice(VALUE_BIT_COUNT - LOW_BIT_COUNT), 2);
+      const shapeBits = (leadingRunLength ^ trailingRunLength) & DIGEST_FIELD_MASK;
+      return {
+        bits, leadingRunLength, trailingRunLength, lowBits, shapeBits,
+        leadingBit: bits[0], trailingBit: bits[lastPosition],
+        digest: (shapeBits << LOW_BIT_COUNT) | lowBits,
+      };
+    }
+    function formatDigest(digest) {
+      return "0x" + digest.toString(16).toUpperCase().padStart(DIGEST_HEX_DIGIT_COUNT, "0");
+    }
+    function formatFieldBits(fieldValue) {
+      return fieldValue.toString(2).padStart(LOW_BIT_COUNT, "0");
+    }
+
+    /* ---------- 가. 값 성분을 켜고 끄기 ---------- */
+    const STEP_COUNT = 3000;
+    const TRACE_SEED = 41;
+    const REGISTER_COUNT = 3;
+    const RELATED_REGISTER = 0;
+    const REGISTER_NAMES = ["R1", "R2", "R3"];
+    const REGISTER_ROLES = ["방향과 관련된 값", "무관한 값", "루프 카운터"];
+    const KIND_LABELS = ["0", "1", "−1", "정렬된 포인터"];
+    const KIND_PREFERS_TAKEN = [true, false, true, false];
+    const POINTER_BASE = 0x00007f0000000000n;
+    const POINTER_ALIGNMENT = 64n;
+    const POINTER_SLOT_COUNT = 500000;
+    // 종류마다 값을 만드는 방법. 포인터는 주소가 매번 달라도 64바이트 정렬이라 digest가 같게 나온다.
+    const KIND_VALUE_MAKERS = [
+      () => 0n,
+      () => 1n,
+      () => VALUE_MASK,
+      (draw) => POINTER_BASE + BigInt(2 * Math.floor(draw * POINTER_SLOT_COUNT) + 1) * POINTER_ALIGNMENT,
+    ];
+    const KIND_DIGESTS = KIND_VALUE_MAKERS.map((makeValue) => describeValue(makeValue(0)).digest);
+    const DIGEST_SPACE_SIZE = 1 << (LOW_BIT_COUNT * 2);
+    const WEIGHT_LIMIT = 31;
+    const TRAINING_THRESHOLD = 12;
+    const VALUE_GAIN = 2.5;
+    const USEFULNESS_START = 0.5;
+    const USEFULNESS_SMOOTHING = 1 / 64;
+    const USEFULNESS_GATE = 0.58;
+    const ACCURACY_WINDOW = 200;
+    const ACCURACY_SAMPLE_INTERVAL = 25;
+    const CHART_MINIMUM_ACCURACY = 0.4;
+    const WIDE_LAYOUT_WIDTH = 520;
+    const PANEL_TITLE_HEIGHT = 24;
+    const PANEL_ROW_HEIGHT = 26;
+    const PANEL_GAP = 18;
+
+    // 값의 종류와 난수는 한 번만 뽑아 둔다. 슬라이더를 움직여도 같은 실행열에서 조건만 달라지게 하려는 것이다.
+    const traceRandom = BranchBook.createRandom(TRACE_SEED);
+    const steps = [];
+    for (let stepIndex = 0; stepIndex < STEP_COUNT; stepIndex++) {
+      const relatedKind = Math.floor(traceRandom() * KIND_LABELS.length);
+      const unrelatedKind = Math.floor(traceRandom() * KIND_LABELS.length);
+      const relatedValue = KIND_VALUE_MAKERS[relatedKind](traceRandom());
+      const unrelatedValue = KIND_VALUE_MAKERS[unrelatedKind](traceRandom());
+      steps.push({
+        relatedKind,
+        digests: [describeValue(relatedValue).digest, describeValue(unrelatedValue).digest, describeValue(BigInt(stepIndex)).digest],
+        outcomeDraw: traceRandom(),
+        readyDraw: traceRandom(),
+        trainingDraw: traceRandom(),
+      });
+    }
+
+    function clampWeight(weight) {
+      return BranchBook.clamp(weight, -WEIGHT_LIMIT, WEIGHT_LIMIT);
+    }
+    /** 실행열 전체를 보정기 하나에 흘려 정확도 변화와 학습된 표를 돌려준다. */
+    function runCorrector(isValueEnabled, strength, readyFraction) {
+      let biasWeight = 0;
+      // history가 매번 같으므로 history 성분이 읽는 칸은 늘 하나다.
+      let historyWeight = 0;
+      const valueWeights = REGISTER_NAMES.map(() => new Int8Array(DIGEST_SPACE_SIZE));
+      const usefulness = REGISTER_NAMES.map(() => USEFULNESS_START);
+      const usedCounts = REGISTER_NAMES.map(() => 0);
+      const isCorrectList = new Uint8Array(STEP_COUNT);
+      steps.forEach((step, stepIndex) => {
+        const prefersTaken = KIND_PREFERS_TAKEN[step.relatedKind];
+        const taken = step.outcomeDraw < strength ? prefersTaken : !prefersTaken;
+        // R1은 분기 가까이에서 만들어져 예측 때 아직 계산 중일 수 있다. R2와 R3은 오래전에 써진 값이라 늘 준비되어 있다.
+        const isReadyList = [step.readyDraw < readyFraction, true, true];
+        let selectedRegister = -1;
+        for (let registerIndex = 0; registerIndex < REGISTER_COUNT && isValueEnabled; registerIndex++) {
+          if (!isReadyList[registerIndex]) continue;
+          if (selectedRegister === -1 || usefulness[registerIndex] > usefulness[selectedRegister]) selectedRegister = registerIndex;
+        }
+        let sum = biasWeight + historyWeight;
+        if (selectedRegister !== -1 && usefulness[selectedRegister] > USEFULNESS_GATE) {
+          sum += VALUE_GAIN * valueWeights[selectedRegister][step.digests[selectedRegister]];
+          usedCounts[selectedRegister]++;
+        }
+        const isPredictedTaken = sum >= 0;
+        if (isPredictedTaken === taken) isCorrectList[stepIndex] = 1;
+        const direction = taken ? 1 : -1;
+        if (isPredictedTaken !== taken || Math.abs(sum) < TRAINING_THRESHOLD) {
+          biasWeight = clampWeight(biasWeight + direction);
+          historyWeight = clampWeight(historyWeight + direction);
+        }
+        if (isValueEnabled) {
+          // 준비되어 있던 register 가운데 하나만 골라 갱신한다. 준비되지 않았던 값으로는 배우지 않는다.
+          const readyRegisters = [];
+          isReadyList.forEach((isReady, registerIndex) => { if (isReady) readyRegisters.push(registerIndex); });
+          const trainedRegister = readyRegisters[Math.floor(step.trainingDraw * readyRegisters.length)];
+          const digest = step.digests[trainedRegister];
+          const weight = valueWeights[trainedRegister][digest];
+          if (weight !== 0) {
+            const isVoteCorrect = (weight > 0) === taken;
+            usefulness[trainedRegister] += USEFULNESS_SMOOTHING * ((isVoteCorrect ? 1 : 0) - usefulness[trainedRegister]);
+          }
+          valueWeights[trainedRegister][digest] = clampWeight(weight + direction);
+        }
+      });
+      const accuracySeries = [];
+      for (let sampleEnd = ACCURACY_WINDOW; sampleEnd <= STEP_COUNT; sampleEnd += ACCURACY_SAMPLE_INTERVAL) {
+        let correctCount = 0;
+        for (let stepIndex = sampleEnd - ACCURACY_WINDOW; stepIndex < sampleEnd; stepIndex++) correctCount += isCorrectList[stepIndex];
+        accuracySeries.push([sampleEnd, correctCount / ACCURACY_WINDOW]);
+      }
+      const lateStart = Math.floor(STEP_COUNT / 2);
+      let lateCorrectCount = 0;
+      for (let stepIndex = lateStart; stepIndex < STEP_COUNT; stepIndex++) lateCorrectCount += isCorrectList[stepIndex];
+      return {
+        accuracySeries, usefulness, usedCounts,
+        lateAccuracy: lateCorrectCount / (STEP_COUNT - lateStart),
+        relatedWeights: KIND_DIGESTS.map((digest) => valueWeights[RELATED_REGISTER][digest]),
+      };
+    }
+
+    let correlationState = null;
+    let correlationChart = null;
+    function refreshCorrelation() {
+      const strength = strengthControl.value / 100;
+      const readyFraction = readyControl.value / 100;
+      const historyOnly = runCorrector(false, strength, readyFraction);
+      const withValue = enableControl.checked ? runCorrector(true, strength, readyFraction) : null;
+      correlationState = { historyOnly, withValue };
+      BranchBook.setContent("digest-history-accuracy", BranchBook.formatPercent(historyOnly.lateAccuracy));
+      if (!withValue) {
+        BranchBook.setContent("digest-value-accuracy", "꺼짐");
+        BranchBook.setContent("digest-gain", "—");
+        BranchBook.setContent("digest-selected", "—");
+      } else {
+        const gainPoints = (withValue.lateAccuracy - historyOnly.lateAccuracy) * 100;
+        let mostUsedRegister = 0;
+        withValue.usedCounts.forEach((count, registerIndex) => { if (count > withValue.usedCounts[mostUsedRegister]) mostUsedRegister = registerIndex; });
+        const mostUsedCount = withValue.usedCounts[mostUsedRegister];
+        BranchBook.setContent("digest-value-accuracy", BranchBook.formatPercent(withValue.lateAccuracy));
+        BranchBook.setContent("digest-gain", (gainPoints >= 0 ? "+" : "") + gainPoints.toFixed(1) + "<small>%p</small>");
+        BranchBook.setContent("digest-selected", mostUsedCount === 0 ? "없음" : REGISTER_NAMES[mostUsedRegister] + "<small>예측의 " + BranchBook.formatPercent(mostUsedCount / STEP_COUNT, 0) + "</small>");
+      }
+      correlationCanvas.redraw();
+    }
+    const enableControl = BranchBook.bindCheckbox("digest-enable", refreshCorrelation);
+    const strengthControl = BranchBook.bindRange("digest-strength", (value) => value + "%", refreshCorrelation);
+    const readyControl = BranchBook.bindRange("digest-ready", (value) => value + "%", refreshCorrelation);
+
+    function correlationHeight(width) {
+      const chartHeight = width >= WIDE_LAYOUT_WIDTH ? 200 : 170;
+      const usefulnessPanelHeight = PANEL_TITLE_HEIGHT + REGISTER_COUNT * PANEL_ROW_HEIGHT;
+      const weightPanelHeight = PANEL_TITLE_HEIGHT + KIND_LABELS.length * PANEL_ROW_HEIGHT;
+      const panelsHeight = width >= WIDE_LAYOUT_WIDTH ? Math.max(usefulnessPanelHeight, weightPanelHeight) : usefulnessPanelHeight + PANEL_GAP + weightPanelHeight;
+      return 12 + chartHeight + 56 + panelsHeight + 10;
+    }
+    /** register별 쓸모 점수: 0–100% 막대와 문턱 표시. */
+    function drawUsefulnessPanel(context, palette, panel, result) {
+      context.fillStyle = palette.textDim; context.font = "12px " + palette.font; context.textAlign = "left"; context.textBaseline = "middle";
+      context.fillText("register별 쓸모 점수 (최근에 방향을 맞힌 비율)", panel.x, panel.y + 8);
+      const labelWidth = panel.width >= 300 ? 150 : 28;
+      const valueWidth = 42;
+      const trackLeft = panel.x + labelWidth + 8;
+      const trackWidth = panel.width - labelWidth - valueWidth - 12;
+      let bestRegister = -1;
+      if (result) {
+        result.usefulness.forEach((score, registerIndex) => { if (bestRegister === -1 || score > result.usefulness[bestRegister]) bestRegister = registerIndex; });
+      }
+      REGISTER_NAMES.forEach((registerName, registerIndex) => {
+        const rowY = panel.y + PANEL_TITLE_HEIGHT + registerIndex * PANEL_ROW_HEIGHT;
+        const score = result ? result.usefulness[registerIndex] : 0;
+        const isChosen = result !== null && registerIndex === bestRegister && score > USEFULNESS_GATE;
+        context.fillStyle = palette.text; context.font = "12px " + palette.font; context.textAlign = "left";
+        context.fillText(panel.width >= 300 ? registerName + " · " + REGISTER_ROLES[registerIndex] : registerName, panel.x, rowY + 10);
+        context.fillStyle = palette.surface;
+        BranchBook.roundedRectangle(context, trackLeft, rowY + 2, trackWidth, 16, 3); context.fill();
+        if (result) {
+          context.fillStyle = isChosen ? palette.accent : palette.textFaint;
+          BranchBook.roundedRectangle(context, trackLeft, rowY + 2, Math.max(3, trackWidth * score), 16, 3); context.fill();
+        }
+        context.fillStyle = palette.text; context.font = "600 12px " + palette.mono; context.textAlign = "right";
+        context.fillText(result ? BranchBook.formatPercent(score, 0) : "—", panel.x + panel.width, rowY + 10);
+      });
+      const gateX = Math.round(trackLeft + trackWidth * USEFULNESS_GATE) + 0.5;
+      const rowsTop = panel.y + PANEL_TITLE_HEIGHT;
+      context.strokeStyle = palette.text; context.lineWidth = 1; context.setLineDash([3, 3]);
+      context.beginPath(); context.moveTo(gateX, rowsTop - 2); context.lineTo(gateX, rowsTop + REGISTER_COUNT * PANEL_ROW_HEIGHT - 4); context.stroke();
+      context.setLineDash([]);
+    }
+    /** R1의 digest별 가중치: 가운데가 0, 오른쪽이 taken 쪽, 왼쪽이 not-taken 쪽. */
+    function drawWeightPanel(context, palette, panel, result) {
+      context.fillStyle = palette.textDim; context.font = "12px " + palette.font; context.textAlign = "left"; context.textBaseline = "middle";
+      context.fillText("R1의 digest별 가중치 (왼쪽 N, 오른쪽 T)", panel.x, panel.y + 8);
+      const labelWidth = panel.width >= 300 ? 150 : 46;
+      const valueWidth = 32;
+      const trackLeft = panel.x + labelWidth + 8;
+      const trackWidth = panel.width - labelWidth - valueWidth - 12;
+      const zeroX = trackLeft + trackWidth / 2;
+      KIND_LABELS.forEach((kindLabel, kindIndex) => {
+        const rowY = panel.y + PANEL_TITLE_HEIGHT + kindIndex * PANEL_ROW_HEIGHT;
+        const weight = result ? result.relatedWeights[kindIndex] : 0;
+        context.textAlign = "left";
+        if (panel.width >= 300) {
+          context.fillStyle = palette.text; context.font = "12px " + palette.font;
+          context.fillText(kindLabel, panel.x, rowY + 10);
+          context.fillStyle = palette.textDim; context.font = "11px " + palette.mono; context.textAlign = "right";
+          context.fillText(formatDigest(KIND_DIGESTS[kindIndex]), panel.x + labelWidth, rowY + 10);
+        } else {
+          context.fillStyle = palette.text; context.font = "11px " + palette.mono;
+          context.fillText(formatDigest(KIND_DIGESTS[kindIndex]), panel.x, rowY + 10);
+        }
+        context.fillStyle = palette.surface;
+        BranchBook.roundedRectangle(context, trackLeft, rowY + 2, trackWidth, 16, 3); context.fill();
+        const barLength = (Math.abs(weight) / WEIGHT_LIMIT) * (trackWidth / 2);
+        if (weight > 0) { context.fillStyle = palette.taken; context.fillRect(zeroX, rowY + 2, barLength, 16); }
+        if (weight < 0) { context.fillStyle = palette.notTaken; context.fillRect(zeroX - barLength, rowY + 2, barLength, 16); }
+        context.fillStyle = palette.text; context.font = "600 12px " + palette.mono; context.textAlign = "right";
+        context.fillText(result ? String(weight) : "—", panel.x + panel.width, rowY + 10);
+      });
+      const rowsTop = panel.y + PANEL_TITLE_HEIGHT;
+      context.strokeStyle = palette.axis; context.lineWidth = 1;
+      context.beginPath(); context.moveTo(Math.round(zeroX) + 0.5, rowsTop - 2); context.lineTo(Math.round(zeroX) + 0.5, rowsTop + KIND_LABELS.length * PANEL_ROW_HEIGHT - 4); context.stroke();
+    }
+    const correlationCanvas = BranchBook.createCanvas("digest-canvas", (context, width, height, palette) => {
+      if (!correlationState) return;
+      const isWide = width >= WIDE_LAYOUT_WIDTH;
+      const chartHeight = isWide ? 200 : 170;
+      const chart = BranchBook.drawChart(context, { x: 56, y: 12, width: width - 72, height: chartHeight }, {
+        xMinimum: 0, xMaximum: STEP_COUNT, yMinimum: CHART_MINIMUM_ACCURACY, yMaximum: 1,
+        xTicks: 3, yTicks: 3, xLabel: "분기를 실행한 횟수", yLabel: "최근 " + ACCURACY_WINDOW + "번의 정확도",
+        xFormat: (value) => String(Math.round(value)), yFormat: (value) => Math.round(value * 100) + "%",
+      });
+      correlationChart = chart;
+      if (correlationState.withValue) BranchBook.drawLine(context, chart, correlationState.withValue.accuracySeries, palette.series[1], { lineWidth: 2.5 });
+      BranchBook.drawLine(context, chart, correlationState.historyOnly.accuracySeries, palette.series[0], { lineWidth: 2.5 });
+      const panelsTop = 12 + chartHeight + 56;
+      const usefulnessPanelHeight = PANEL_TITLE_HEIGHT + REGISTER_COUNT * PANEL_ROW_HEIGHT;
+      const usefulnessPanel = { x: 12, y: panelsTop, width: isWide ? (width - 24 - PANEL_GAP * 2) / 2 : width - 24 };
+      const weightPanel = {
+        x: isWide ? usefulnessPanel.x + usefulnessPanel.width + PANEL_GAP * 2 : 12,
+        y: isWide ? panelsTop : panelsTop + usefulnessPanelHeight + PANEL_GAP,
+        width: usefulnessPanel.width,
+      };
+      drawUsefulnessPanel(context, palette, usefulnessPanel, correlationState.withValue);
+      drawWeightPanel(context, palette, weightPanel, correlationState.withValue);
+    }, { heightForWidth: correlationHeight });
+    BranchBook.attachTooltip("digest-canvas", (x, y) => {
+      if (!correlationChart || !correlationState) return null;
+      const bounds = correlationChart.bounds;
+      if (x < bounds.x || x > bounds.x + bounds.width || y < bounds.y || y > bounds.y + bounds.height) return null;
+      const series = correlationState.historyOnly.accuracySeries;
+      const fraction = (x - bounds.x) / bounds.width;
+      const sampleIndex = BranchBook.clamp(Math.round(fraction * STEP_COUNT / ACCURACY_SAMPLE_INTERVAL) - ACCURACY_WINDOW / ACCURACY_SAMPLE_INTERVAL, 0, series.length - 1);
+      const historyAccuracy = series[sampleIndex][1];
+      let html = series[sampleIndex][0] + "번째 · history만 <b>" + BranchBook.formatPercent(historyAccuracy, 0) + "</b>";
+      let anchorAccuracy = historyAccuracy;
+      if (correlationState.withValue) {
+        const valueAccuracy = correlationState.withValue.accuracySeries[sampleIndex][1];
+        html += " · 값 성분 포함 <b>" + BranchBook.formatPercent(valueAccuracy, 0) + "</b>";
+        anchorAccuracy = Math.max(anchorAccuracy, valueAccuracy);
+      }
+      return { x: correlationChart.toX(series[sampleIndex][0]), y: correlationChart.toY(Math.max(anchorAccuracy, CHART_MINIMUM_ACCURACY)), html };
+    });
+
+    /* ---------- 나. digest 만들어 보기 ---------- */
+    const BITS_PER_HEX_DIGIT = 4;
+    const PRESETS = {
+      "digest-preset-threshold": [0x1040n, 0x1f40n],
+      "digest-preset-pointer": [0x00007f3a1c2b40c0n, 0x00007f5510e883c0n],
+      "digest-preset-small": [5n, 6n],
+      "digest-preset-sign": [0n, VALUE_MASK],
+    };
+    function createEditor(prefix, onChange) {
+      const input = document.getElementById(prefix + "-input");
+      const grid = document.getElementById(prefix + "-grid");
+      const breakdown = document.getElementById(prefix + "-breakdown");
+      let value = 0n;
+      const cells = [];
+      for (let position = 0; position < VALUE_BIT_COUNT; position++) {
+        const bitNumber = VALUE_BIT_COUNT - 1 - position;
+        const cell = document.createElement("button");
+        cell.type = "button";
+        cell.className = "bit-cell";
+        cell.setAttribute("aria-label", "bit " + bitNumber);
+        // 누른 bit 하나만 뒤집는다.
+        cell.addEventListener("click", () => { setValue(value ^ (1n << BigInt(bitNumber)), true); });
+        grid.appendChild(cell);
+        cells.push(cell);
+      }
+      function render(shouldRewriteInput) {
+        const description = describeValue(value);
+        cells.forEach((cell, position) => {
+          const isOne = description.bits[position] === "1";
+          cell.textContent = description.bits[position];
+          cell.classList.toggle("is-one", isOne);
+          cell.classList.toggle("in-leading-run", position < description.leadingRunLength);
+          cell.classList.toggle("in-trailing-run", position >= VALUE_BIT_COUNT - description.trailingRunLength);
+          cell.classList.toggle("in-low-bits", position >= VALUE_BIT_COUNT - LOW_BIT_COUNT);
+        });
+        if (shouldRewriteInput) input.value = value.toString(16).toUpperCase().padStart(HEX_DIGIT_COUNT, "0");
+        input.classList.remove("is-invalid");
+        const runXor = description.leadingRunLength ^ description.trailingRunLength;
+        breakdown.innerHTML =
+          "<span>10진수</span><span class=\"digest-breakdown-value\">" + value.toLocaleString("en-US") + "</span>" +
+          "<span>맨 위 구간</span><span class=\"digest-breakdown-value\">" + description.leadingBit + "이 " + description.leadingRunLength + "개</span>" +
+          "<span>맨 아래 구간</span><span class=\"digest-breakdown-value\">" + description.trailingBit + "이 " + description.trailingRunLength + "개</span>" +
+          "<span>두 길이의 XOR</span><span class=\"digest-breakdown-value\">" + description.leadingRunLength + " XOR " + description.trailingRunLength + " = " + runXor + ", 아래 6 bit는 " + formatFieldBits(description.shapeBits) + "</span>" +
+          "<span>하위 6 bit</span><span class=\"digest-breakdown-value\">" + formatFieldBits(description.lowBits) + "</span>" +
+          "<span>digest</span><span class=\"digest-breakdown-value\"><b>" + formatFieldBits(description.shapeBits) + " " + formatFieldBits(description.lowBits) + " = " + formatDigest(description.digest) + "</b></span>";
+      }
+      function setValue(nextValue, shouldRewriteInput) {
+        value = nextValue & VALUE_MASK;
+        render(shouldRewriteInput);
+        onChange();
+      }
+      input.addEventListener("input", () => {
+        const text = input.value.trim();
+        const isValidHex = /^[0-9a-fA-F]{1,16}$/.test(text);
+        if (!isValidHex) { input.classList.add("is-invalid"); return; }
+        // 입력 중에는 글자를 고쳐 쓰지 않는다. 커서가 튀지 않게 하려는 것이다.
+        setValue(BigInt("0x" + text), false);
+      });
+      input.addEventListener("change", () => { render(true); });
+      return {
+        get value() { return value; },
+        get digest() { return describeValue(value).digest; },
+        set(nextValue) { setValue(nextValue, true); },
+      };
+    }
+    let isExplorerReady = false;
+    function refreshExplorer() {
+      if (!isExplorerReady) return;
+      const firstDigest = firstEditor.digest;
+      const secondDigest = secondEditor.digest;
+      BranchBook.setContent("digest-first-result", formatDigest(firstDigest));
+      BranchBook.setContent("digest-second-result", formatDigest(secondDigest));
+      let verdict = "digest가 다르다<small>구별된다</small>";
+      if (firstDigest === secondDigest) verdict = "충돌<small>값은 다른데 digest가 같다</small>";
+      if (firstEditor.value === secondEditor.value) verdict = "같은 값";
+      BranchBook.setContent("digest-verdict", verdict);
+    }
+    const firstEditor = createEditor("digest-first", refreshExplorer);
+    const secondEditor = createEditor("digest-second", refreshExplorer);
+    isExplorerReady = true;
+    Object.keys(PRESETS).forEach((buttonId) => {
+      BranchBook.bindButton(buttonId, () => {
+        firstEditor.set(PRESETS[buttonId][0]);
+        secondEditor.set(PRESETS[buttonId][1]);
+      });
+    });
+    firstEditor.set(PRESETS["digest-preset-threshold"][0]);
+    secondEditor.set(PRESETS["digest-preset-threshold"][1]);
+
+    /* ---------- 두 부분 바꾸기 ---------- */
+    const correlationPanel = document.getElementById("digest-correlation-panel");
+    const explorerPanel = document.getElementById("digest-explorer-panel");
+    BranchBook.bindSegmented("digest-part", (part) => {
+      correlationPanel.hidden = part !== "correlation";
+      explorerPanel.hidden = part !== "explorer";
+    });
+    refreshCorrelation();
+  })();
+
+  /* ============================================================ 퀴즈 */
+  BranchBook.renderQuiz("chapter-quiz", [
+    {
+      question: "무작위 값이 든 배열을 훑는 <code>if (A[i] &gt; threshold)</code> 분기에서, TAGE가 '다수 방향만 찍기'를 넘지 못하는 까닭은?",
+      options: ["TAGE의 표가 작아서 패턴을 다 담지 못하기 때문이다", "방향을 정하는 A[i]의 값이 과거 방향 기록 어디에도 들어 있지 않기 때문이다", "history가 너무 짧아서이며, 더 길게 보면 풀린다", "분기가 너무 자주 실행되어 학습이 따라가지 못하기 때문이다"],
+      answerIndex: 1,
+      explanation: "값들이 서로 무관하면 과거의 taken, not-taken은 다음 값에 대해 아무것도 알려 주지 않는다. 표를 키우거나 history를 늘려도 없는 정보가 생기지는 않는다. Branch Runahead 논문은 용량 무제한 예측기로도 이런 분기의 오예측률이 평균 11%에서 9%로만 내려간다고 보고한다.",
+    },
+    {
+      question: "Branch Runahead에서 helper가 main보다 앞설 수 있는 근거와, 그 이점이 사라지는 경우를 바르게 짝지은 것은?",
+      options: ["helper가 더 빠른 코어에서 돌기 때문이다. 코어가 같으면 이점이 없다", "helper는 chain에 속한 명령만 실행하기 때문이다. 루프 본문이 짧거나 chain 안의 load가 느리면 이점이 사라진다", "helper는 분기를 예측하지 않기 때문이다. 분기가 많으면 이점이 사라진다", "helper는 결과를 저장하지 않기 때문이다. queue가 크면 이점이 사라진다"],
+      answerIndex: 1,
+      explanation: "main은 본문 전체를 가져와야 하고 helper는 분기에 필요한 계산만 한다. 건너뛸 일이 적거나(본문이 짧다) chain이 오래 걸리면(load 지연) 결과가 fetch보다 늦게 온다. 논문도 제때 만들어진 예측이 약 40%라고 밝히며 timeliness를 가장 어려운 문제로 꼽는다.",
+    },
+    {
+      question: "예측이 틀린 분기가 있다. fetch를 0으로 두면 helper 결과는 12 cycle에, 원래의 resolve는 30 cycle에 온다. 'override만' 쓰는 방식과 '조기 flush' 방식이 버리는 시간은 각각 얼마인가? (flush 뒤 다시 채우는 시간은 뺀다)",
+      options: ["둘 다 12 cycle", "override만 30 cycle, 조기 flush 12 cycle", "override만 12 cycle, 조기 flush 0 cycle", "override만 30 cycle, 조기 flush 18 cycle"],
+      answerIndex: 1,
+      explanation: "override는 결과가 fetch 전에 와야 쓸 수 있다. 12 cycle 늦었으므로 쓰지 못하고 baseline과 같이 30 cycle을 버린다. 조기 flush는 결과가 온 12 cycle에 바로 고치므로 그때까지의 12 cycle만 버린다. 이미 지나간 12 cycle은 되돌릴 수 없다.",
+    },
+    {
+      question: "RUNLTS의 register 값 digest에 대한 설명으로 옳은 것은?",
+      options: ["분기가 앞으로 읽을 값을 미리 계산해서 만든다", "64-bit 값을 손실 없이 12 bit로 압축한 것이라 서로 다른 값은 항상 다른 digest가 된다", "예측 시점에 이미 계산이 끝나 유효한 것만 읽으며, 서로 다른 값이 같은 digest가 될 수 있다", "분기가 직접 비교하는 register의 값에 대해서만 만든다"],
+      answerIndex: 2,
+      explanation: "RUNLTS는 명령을 더 실행하지 않고 이미 register에 써진 값만 쓴다. digest는 맨 위와 맨 아래에서 같은 bit가 이어진 길이와 하위 6 bit로 만들므로 값의 모양만 남는다. 또 분기의 피연산자가 아닌 register도 후보이고, 어느 것이 쓸모 있는지는 usefulness 표가 배운다.",
+    },
+    {
+      question: "이 장의 수치를 바르게 읽은 것은?",
+      options: ["RUNLTS의 MPKI 3.197은 TEA의 10.1%보다 작으므로 TEA가 더 좋은 기법이다", "Branch Runahead의 IPC 13.7%와 TEA의 10.1%는 둘 다 SPEC과 GAP이므로 그대로 비교해도 된다", "RUNLTS의 MPKI는 CBP trace에 대한 정확도 평가이므로 SPEC이나 GAP의 IPC 향상으로 바꿔 읽지 않는다", "RUNLTS 공개판의 105개 trace 결과와 확장판의 673개 trace 결과는 같은 논문이므로 평균을 내도 된다"],
+      answerIndex: 2,
+      explanation: "세 논문은 지표, baseline, workload, 코어가 서로 다르다. Branch Runahead와 TEA도 benchmark를 고른 기준과 코어 폭이 달라서 바로 비교할 수 없다. 같은 조건의 비교는 TEA 논문 안의 재구현 결과(10.1% 대 7.3%)뿐이다. RUNLTS의 공개판과 확장판도 평가 집합이 달라 섞지 않는다.",
+    },
+  ]);
+})();
+</script>
+</body>
+</html>

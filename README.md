@@ -4,6 +4,7 @@
 
 - 사이트: https://sweetweeds.github.io/h2p-book/
 - 구성: 기초 3개 장, 범주별 논문 6개 장(A–F), 종합, 용어집
+- 장별 인터랙티브 실험 34개와 확인 퀴즈
 - 다루는 논문: BranchNet, Branch Runahead, TEA, RUNLTS, Whisper, LLBP, LLBP-X, PURE, Phelps, Alternate Path Fetch, SBRB, Ahead Prediction
 
 ## 읽기 전에
@@ -23,8 +24,28 @@ chapters/*.html     장별 페이지
 css/style.css       공통 스타일
 js/common.js        레이아웃, 실험 도우미, 축소 예측기(bimodal, gshare, TAGE)
 js/papers.js        논문 자료(종합 장과 참고문헌이 함께 사용)
+js/state.js         6장 실험 5개와 퀴즈
+js/latency.js       9장 실험 3개와 퀴즈
 ```
 
 로컬에서 보려면 이 폴더에서 `python3 -m http.server`를 실행하고 브라우저로 엽니다.
+
+## 검증과 배포
+
+저장소 루트에서 실행합니다. 브라우저 검사는 Python `playwright`와 `/usr/bin/google-chrome`이 필요합니다.
+
+```bash
+python3 site/tools/audit_site.py
+python3 site/tools/check_pages.py /tmp/branchbook-check
+python3 site/tools/check_interactions.py
+```
+
+정적 검사는 내부 링크, 장·실험 수, 미완성 스크립트, 공개 제외 표현을 확인합니다.
+화면 검사는 밝은/어두운 데스크톱 및 모바일 스크린샷과 실행 오류를 확인합니다.
+상호작용 검사는 실험 캔버스 초기화, 슬라이더 경계값, 버튼, 퀴즈, 검색과 동적으로 생성된 링크를 확인합니다.
+6장·9장은 noise가 없는 경우의 동등성, 후보 선택과 지연 계산도 검사합니다.
+
+검증 후 `bash site/tools/deploy.sh "사이트 갱신"`으로 전용 공개 저장소 `SweetWeeds/h2p-book`에 배포합니다.
+배포 스크립트는 정적 검사를 통과한 `site/`만 복사하며 `tools/`는 제외합니다.
 
 책의 구성 방식은 [SensorBook](https://sensorbook.euiyun.com)에서 배웠습니다.

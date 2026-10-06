@@ -1,0 +1,1092 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4장 · 묻힌 상관 찾기: BranchNet — BranchBook</title>
+<meta name="description" content="답을 알려 주는 과거 분기가 history 안에 있어도 noise에 묻히면 TAGE는 쓰지 못한다. 위치와 무관하게 횟수를 세는 CNN, BranchNet을 실험으로 읽는다.">
+<link rel="icon" href="../favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/common.js"></script>
+<style>
+  /* 실험 2: history 12칸과 그 아래 단계별 출력을 같은 열에 맞춰 보여 주는 격자 */
+  .pooling-stage { display: flex; flex-direction: column; gap: 8px; }
+  .pooling-step-title { font-size: 13.5px; line-height: 1.55; color: var(--text-dim); margin-top: 8px; }
+  .pooling-step-title b { color: var(--text); margin-right: 6px; }
+  .pooling-grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 3px; }
+  .pooling-token { min-width: 0; height: 46px; padding: 0; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); color: var(--text-dim); font-family: var(--mono); font-size: 12px; line-height: 1.25; cursor: pointer; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+  .pooling-token b { font-size: 13px; font-weight: 600; }
+  .pooling-token:hover { border-color: var(--accent); }
+  .pooling-token.signal { color: #ffffff; font-weight: 600; }
+  .pooling-token.signal.taken { background: var(--taken); border-color: var(--taken); }
+  .pooling-token.signal.not-taken { background: var(--not-taken); border-color: var(--not-taken); }
+  .pooling-cell { min-width: 0; height: 34px; border-radius: 7px; border: 1px solid var(--border); background: var(--surface); display: flex; align-items: center; justify-content: center; font-family: var(--mono); font-size: 14px; color: var(--text-faint); }
+  .pooling-cell.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); font-weight: 600; }
+  .pooling-decision { padding: 12px 14px; border-radius: 9px; border: 1px solid var(--border); background: var(--surface); font-size: 15px; line-height: 1.6; }
+  /* 실험 3: 식 하나를 통째로 보여 주는 넓은 수치 칸 */
+  .statistic.wide { flex-basis: 100%; }
+  .statistic.wide .statistic-value { font-size: 16px; letter-spacing: 0; }
+</style>
+</head>
+<body data-root="../" data-chapter="correlation">
+<main class="chapter">
+  <header class="chapter-hero">
+    <p class="chapter-kicker"></p>
+    <h1>묻힌 상관 찾기: BranchNet</h1>
+    <p class="lead">분기 B의 답을 알려 주는 분기 A가 history 안에 분명히 있다. 그런데 둘 사이에 무관한 분기가 끼어들고 A의 자리가 실행마다 달라지면, history를 통째로 외우는 예측기는 그 단서를 쓰지 못한다. BranchNet은 "어느 자리에 있든 몇 번 나왔는가"를 세는 신경망으로 이 문제에 접근한다.</p>
+    <div class="objectives">
+      <p class="objectives-title">이 장에서 배우는 것</p>
+      <ul>
+        <li>noisy history가 왜 TAGE 같은 표 기반 예측기에 지수적으로 많은 entry를 요구하는지 설명한다.</li>
+        <li>convolution filter와 sum-pooling이 위치와 무관한 "횟수" 특징을 만드는 과정을 손으로 따라간다.</li>
+        <li>Big-BranchNet과 Mini-BranchNet의 역할, offline 학습과 runtime 추론의 구분을 이해한다.</li>
+        <li>논문이 보고한 MPKI와 IPC 결과를 baseline과 함께 읽고, BranchNet이 돕지 못하는 분기를 구별한다.</li>
+      </ul>
+    </div>
+  </header>
+
+  <!-- ============================================================ 1 -->
+  <section id="branchnet">
+    <h2>단서는 history 안에 있다, 다만 묻혀 있다</h2>
+    <div class="paper-card">
+      <span class="paper-title">BranchNet: A Convolutional Neural Network to Predict Hard-To-Predict Branches</span>
+      <span class="paper-meta">Siavash Zangeneh, Stephen Pruett, Sangkug Lym, Yale N. Patt · MICRO 2020 · <a href="https://hps.ece.utexas.edu/pub/BranchNet_Micro2020.pdf" rel="noopener">원문</a></span>
+      <span class="paper-scope">평가 조건: SPEC2017 Integer Speed(시험은 SPEC ref 입력), baseline은 64KB TAGE-SC-L 또는 unlimited MTAGE-SC, 6-wide fetch와 512-entry ROB의 코어 모델 · <b>근거 범위: 논문 전문</b></span>
+    </div>
+    <p><a href="history.html">2장</a>에서 본 TAGE는 과거 분기의 방향을 길게 이어 붙인 <span class="term">global history</span>를 hash해서 표의 entry를 찾는다. 같은 history가 다시 나오면 같은 entry가 답을 준다. 이 방식은 "지금의 history가 예전에 본 history와 정확히 같다"는 전제에 기대고 있다.</p>
+    <p>그 전제가 깨지는 경우가 있다. 분기 B의 결과가 앞서 실행한 분기 A와 같다고 하자. A와 B 사이에 B와 아무 관계가 없는 분기들이 끼어 있고, 그 분기들의 방향과 개수가 실행마다 다르다. 그러면 A가 B에게 주는 정보는 그대로인데, history 전체의 모양은 매번 달라진다. BranchNet 논문은 이런 history를 <span class="term">noisy history</span>라고 부른다. 무관한 분기가 방향을 계속 바꾸거나, 상관 있는 분기가 history 안에서 놓이는 자리가 일정하지 않은 경우다.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 240" role="img" aria-label="같은 A와 B의 관계가 세 번의 실행에서 서로 다른 history 모양으로 나타나는 예">
+        <defs><marker id="correlation-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrow-head"/></marker></defs>
+        <text x="20" y="30" class="label-dim">실행</text>
+        <text x="277" y="30" text-anchor="middle" class="label-dim">B 앞의 history (왼쪽이 오래된 분기)</text>
+        <text x="505" y="30" text-anchor="middle" class="label-dim">B의 결과</text>
+        <text x="640" y="30" text-anchor="middle" class="label-dim">방향만 이으면</text>
+        <text x="785" y="30" text-anchor="middle" class="label-dim">A:T의 횟수</text>
+        <g>
+          <text x="20" y="71" class="label-strong">실행 1</text>
+          <rect x="178" y="46" width="62" height="40" rx="8" class="fill-taken-soft"/><text x="209" y="71" text-anchor="middle" class="label-strong">A:T</text>
+          <rect x="246" y="46" width="62" height="40" rx="8" class="fill-surface"/><text x="277" y="71" text-anchor="middle" class="label-dim">x:N</text>
+          <rect x="314" y="46" width="62" height="40" rx="8" class="fill-surface"/><text x="345" y="71" text-anchor="middle" class="label-dim">y:T</text>
+          <rect x="382" y="46" width="62" height="40" rx="8" class="fill-surface"/><text x="413" y="71" text-anchor="middle" class="label-dim">z:N</text>
+          <path d="M448 66 H466" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+          <rect x="472" y="46" width="66" height="40" rx="8" class="fill-taken-soft"/><text x="505" y="71" text-anchor="middle" class="label-strong">B = T</text>
+          <text x="640" y="71" text-anchor="middle" class="label-mono">T N T N</text>
+          <rect x="750" y="46" width="70" height="40" rx="8" class="fill-accent-soft"/><text x="785" y="71" text-anchor="middle" class="label-strong">1</text>
+        </g>
+        <g>
+          <text x="20" y="125" class="label-strong">실행 2</text>
+          <rect x="314" y="100" width="62" height="40" rx="8" class="fill-taken-soft"/><text x="345" y="125" text-anchor="middle" class="label-strong">A:T</text>
+          <rect x="382" y="100" width="62" height="40" rx="8" class="fill-surface"/><text x="413" y="125" text-anchor="middle" class="label-dim">z:T</text>
+          <path d="M448 120 H466" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+          <rect x="472" y="100" width="66" height="40" rx="8" class="fill-taken-soft"/><text x="505" y="125" text-anchor="middle" class="label-strong">B = T</text>
+          <text x="640" y="125" text-anchor="middle" class="label-mono">T T</text>
+          <rect x="750" y="100" width="70" height="40" rx="8" class="fill-accent-soft"/><text x="785" y="125" text-anchor="middle" class="label-strong">1</text>
+        </g>
+        <g>
+          <text x="20" y="179" class="label-strong">실행 3</text>
+          <rect x="178" y="154" width="62" height="40" rx="8" class="fill-surface"/><text x="209" y="179" text-anchor="middle" class="label-dim">x:T</text>
+          <rect x="246" y="154" width="62" height="40" rx="8" class="fill-not-taken-soft"/><text x="277" y="179" text-anchor="middle" class="label-strong">A:N</text>
+          <rect x="314" y="154" width="62" height="40" rx="8" class="fill-surface"/><text x="345" y="179" text-anchor="middle" class="label-dim">y:N</text>
+          <rect x="382" y="154" width="62" height="40" rx="8" class="fill-surface"/><text x="413" y="179" text-anchor="middle" class="label-dim">y:T</text>
+          <path d="M448 174 H466" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+          <rect x="472" y="154" width="66" height="40" rx="8" class="fill-not-taken-soft"/><text x="505" y="179" text-anchor="middle" class="label-strong">B = N</text>
+          <text x="640" y="179" text-anchor="middle" class="label-mono">T N N T</text>
+          <rect x="750" y="154" width="70" height="40" rx="8" class="fill-accent-soft"/><text x="785" y="179" text-anchor="middle" class="label-strong">0</text>
+        </g>
+        <text x="20" y="224" class="label-dim">x, y, z는 B와 무관한 분기라고 가정한 설명용 예제다. 실제 프로그램의 trace가 아니다.</text>
+      </svg>
+      <figcaption><b>그림 4-1.</b> B는 언제나 A를 따라간다. 그런데 방향만 이은 history는 세 번 모두 다르다. "A가 taken이었던 횟수"로 보면 세 실행이 깔끔하게 갈린다.</figcaption>
+    </figure>
+    <p>표 기반 예측기는 그림의 세 history를 서로 다른 패턴으로 본다. 패턴마다 entry가 따로 필요하고, 각 entry는 그 패턴을 몇 번 겪어야 쓸모가 생긴다. A와 B 사이의 noise 분기가 \(n\)개에서 \(n+j\)개까지 흔들리고 각각의 방향이 제멋대로라면, B 앞에 나올 수 있는 방향 패턴의 수는 다음과 같다.</p>
+    <div class="formula">
+      $$ \text{패턴 수} = \sum_{g=n}^{n+j} 2^{\,g+1} $$
+      <div class="formula-note">\(g\)는 한 번의 실행에서 A와 B 사이에 낀 noise 분기 수다. A의 방향 1 bit와 noise \(g\) bit가 모두 달라질 수 있으므로 \(2^{g+1}\)가지다. noise가 하나 늘 때마다 두 배가 된다.</div>
+    </div>
+    <p>아래 실험에서 직접 확인해 보자. 2장에서 쓴 축소 gshare와 축소 TAGE를 그대로 돌리고, 여기에 "최근 구간 안에 A가 taken이었던 횟수"만 보는 예측기를 나란히 세웠다.</p>
+
+    <div class="simulator" id="simulator-noise">
+      <div class="simulator-head"><span class="simulator-tag">실험 1</span><h3>noise 속에 묻힌 단서</h3></div>
+      <div class="simulator-body side">
+        <div class="simulator-view">
+          <canvas id="noise-history-canvas" data-height="132" aria-label="실행 예 네 개의 history. 색칠된 A의 자리가 실행마다 다르다"></canvas>
+          <div class="legend" style="padding-top: 10px"><span><i class="line" style="background:var(--series-1)"></i>gshare</span><span><i class="line" style="background:var(--series-2)"></i>TAGE</span><span><i class="line" style="background:var(--series-3)"></i>A:T 횟수를 세는 예측기</span></div>
+          <canvas id="noise-chart-canvas" data-height="260" aria-label="noise 분기 수에 따른 분기 B의 예측 정확도. 예측기 세 가지"></canvas>
+        </div>
+        <div class="simulator-controls">
+          <label class="control"><span>A와 B 사이 noise 분기 <output id="noise-count-output"></output></span><input type="range" id="noise-count" min="0" max="10" step="1" value="3"></label>
+          <label class="control"><span>실행마다 달라지는 폭 <output id="noise-jitter-output"></output></span><input type="range" id="noise-jitter" min="0" max="5" step="1" value="0"></label>
+        </div>
+      </div>
+      <div class="simulator-readout">
+        <div class="statistic"><span class="statistic-label">gshare가 B를 맞힌 비율</span><span class="statistic-value" id="noise-gshare">—</span></div>
+        <div class="statistic"><span class="statistic-label">TAGE가 B를 맞힌 비율</span><span class="statistic-value" id="noise-tage">—</span></div>
+        <div class="statistic"><span class="statistic-label">횟수를 세는 예측기</span><span class="statistic-value" id="noise-counting">—</span></div>
+        <div class="statistic"><span class="statistic-label">B 앞에 나올 수 있는 방향 패턴</span><span class="statistic-value" id="noise-patterns">—</span></div>
+      </div>
+      <div class="simulator-note"><b>설명용 모델.</b> 한 번의 실행은 "항상 taken인 분기 16개, A, noise 분기, B" 순서다. A는 반반의 확률로 taken이고 B는 A와 같다. noise 분기의 방향은 무작위이며, 그 개수는 첫 슬라이더 값에서 두 슬라이더의 합 사이에서 실행마다 달라진다. 약 14,000개의 분기(실행 약 500번)를 처음부터 학습하며 돌린 결과다. gshare의 표는 분기끼리 entry가 겹치지 않을 만큼 넉넉하게 잡았다. 그러니 선이 내려가는 것은 표가 모자라서가 아니라 패턴을 겪어 볼 기회가 모자라서다. 세는 예측기에는 "최근 16개 안에서 A가 taken인 칸을 센다"는 filter를 미리 알려 주었다. 축소 gshare와 TAGE는 방향 bit만 history로 쓰므로, 자리가 흔들리면 어느 bit가 A인지 구별하지 못한다. <b>해 볼 것.</b> noise를 0에서 10까지 올려 보고, 다시 noise를 0으로 둔 채 폭만 올려 보자.</div>
+    </div>
+    <p>noise가 없으면 세 예측기 모두 B를 맞힌다. B 바로 앞의 bit가 곧 답이기 때문이다. noise가 늘면 gshare와 TAGE의 선이 함께 내려가 동전 던지기 수준에 닿는다. 외워야 할 패턴은 두 배씩 느는데, 주어진 실행 횟수 안에 각 패턴을 충분히 겪지 못한다. 더 오래 돌리면 작은 noise에서는 결국 따라잡는다. 하지만 noise가 하나 늘 때마다 필요한 entry와 학습 시간이 두 배가 된다는 점은 바뀌지 않는다.</p>
+    <p>폭 슬라이더는 다른 종류의 어려움을 보여 준다. noise가 0이어도 A의 자리가 흔들리면 정확도가 떨어진다. 방향 bit만 봐서는 "지금 B 앞의 몇 번째 bit가 A인가"를 알 수 없기 때문이다. 세는 예측기는 두 슬라이더에 모두 무관하다. A가 구간 안 어디에 있든 횟수는 같다.</p>
+    <div class="callout">
+      <strong>문제는 정보가 아니라 표현이다</strong>
+      <p>세 예측기는 같은 history를 입력으로 받는다. 차이는 그 history를 어떻게 요약하느냐에 있다. BranchNet 논문의 주장도 여기에 있다. noisy history에서 상관을 찾지 못하는 것은 TAGE의 설계 실수가 아니라, 실행 중에 싸고 빠르게 학습해야 한다는 제약에서 나오는 근본적인 한계라는 것이다.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ 2 -->
+  <section id="counting">
+    <h2>논문의 예제: 세면 풀리는 분기</h2>
+    <p>논문은 SPEC2017 벤치마크 leela에서 오예측을 많이 내는 코드 조각을 단순화해 예제로 쓴다. leela는 바둑 프로그램이고, 실행 시간의 대부분을 바둑판의 성질을 평가하는 데 쓴다.</p>
+<pre><code>int x = 0;
+for (int i = 0; i &lt; N; ++i) {
+  if (random_condition(alpha)) {   // Branch A
+    x += 1;                        // A가 not-taken이면 x가 1 늘어난다
+  }
+}
+
+uncorrelated_function();           // B와 무관한 분기가 여럿 실행된다
+
+for (int j = 0; j &lt; x; ++j) {      // Branch B: 루프를 빠져나갈 때 taken
+  ...
+}</code></pre>
+    <p>B는 두 번째 루프를 끝내는 분기다. 반복 횟수는 <code>x</code>이고, <code>x</code>는 첫 번째 루프에서 A가 not-taken이었던 횟수와 같다. 그러니 B를 맞히는 데 필요한 값은 둘 다 history에 들어 있다. <code>x</code>는 history 속 A의 not-taken 횟수이고, <code>j</code>는 B의 not-taken 횟수다. 둘이 같아지는 순간 B는 taken이 된다.</p>
+    <p>표 기반 예측기는 이 관계를 쓰지 못한다. 어떤 분기가 쓸모 있는지 모르는 채로 history 전체를 hash하기 때문이다. 논문의 계산으로는 <code>N</code>이 10이고 무관한 함수에 조건부 분기가 20개 있을 때, TAGE 같은 예측기는 적어도 \(10 \times 2^{(10+20)}\)개의 history 패턴에 저장 공간을 주어야 한다.</p>
+    <div class="callout evidence">
+      <strong>논문이 보고한 값</strong>
+      <p>위 예제의 Branch B를 Multi-Perspective Perceptron과 TAGE-SC-L은 81%의 정확도로 예측했다. 항상 not-taken이라고 답할 때의 78%보다 조금 나은 수준이다. 손으로 weight를 정한 CNN은 같은 분기를 100% 맞혔다(원문 IV절, Fig. 3).</p>
+    </div>
+    <p>그 CNN이 하는 일은 단순하다. 채널 하나는 "A가 not-taken인 칸"을, 다른 채널은 "B가 not-taken인 칸"을 표시한다. 채널마다 표시된 칸의 수를 더하면 <code>x</code>와 <code>j</code>가 나온다. 마지막 뉴런은 둘을 비교한다.</p>
+    <figure class="diagram">
+      <svg viewBox="0 24 860 276" role="img" aria-label="history에서 A의 not-taken 횟수와 B의 not-taken 횟수를 세어 비교하는 CNN의 흐름">
+        <text x="20" y="64" class="label-strong">history</text>
+        <text x="20" y="82" class="label-dim">(분기, 방향)</text>
+        <g>
+          <rect x="190" y="40" width="58" height="40" rx="8" class="fill-not-taken-soft"/><text x="219" y="65" text-anchor="middle" class="label-strong">A:N</text>
+          <rect x="256" y="40" width="58" height="40" rx="8" class="fill-taken-soft"/><text x="285" y="65" text-anchor="middle" class="label-strong">A:T</text>
+          <rect x="322" y="40" width="58" height="40" rx="8" class="fill-not-taken-soft"/><text x="351" y="65" text-anchor="middle" class="label-strong">A:N</text>
+          <rect x="388" y="40" width="58" height="40" rx="8" class="fill-surface"/><text x="417" y="65" text-anchor="middle" class="label-dim">X:T</text>
+          <rect x="454" y="40" width="58" height="40" rx="8" class="fill-surface"/><text x="483" y="65" text-anchor="middle" class="label-dim">X:N</text>
+          <rect x="520" y="40" width="58" height="40" rx="8" class="fill-surface"/><text x="549" y="65" text-anchor="middle" class="label-dim">X:T</text>
+          <rect x="586" y="40" width="58" height="40" rx="8" class="fill-not-taken-soft"/><text x="615" y="65" text-anchor="middle" class="label-strong">B:N</text>
+        </g>
+        <text x="190" y="100" class="label-dim">오래된 분기</text>
+        <text x="644" y="100" text-anchor="end" class="label-dim">가장 최근 분기</text>
+        <text x="20" y="138" class="label-strong">channel 1</text>
+        <text x="20" y="156" class="label-dim">A가 not-taken인 칸</text>
+        <g>
+          <rect x="190" y="120" width="58" height="36" rx="8" class="fill-accent-soft"/><text x="219" y="143" text-anchor="middle" class="label-strong">1</text>
+          <rect x="256" y="120" width="58" height="36" rx="8" class="fill-surface"/><text x="285" y="143" text-anchor="middle" class="label-dim">0</text>
+          <rect x="322" y="120" width="58" height="36" rx="8" class="fill-accent-soft"/><text x="351" y="143" text-anchor="middle" class="label-strong">1</text>
+          <rect x="388" y="120" width="58" height="36" rx="8" class="fill-surface"/><text x="417" y="143" text-anchor="middle" class="label-dim">0</text>
+          <rect x="454" y="120" width="58" height="36" rx="8" class="fill-surface"/><text x="483" y="143" text-anchor="middle" class="label-dim">0</text>
+          <rect x="520" y="120" width="58" height="36" rx="8" class="fill-surface"/><text x="549" y="143" text-anchor="middle" class="label-dim">0</text>
+          <rect x="586" y="120" width="58" height="36" rx="8" class="fill-surface"/><text x="615" y="143" text-anchor="middle" class="label-dim">0</text>
+        </g>
+        <path d="M650 138 H684" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+        <rect x="690" y="120" width="86" height="36" rx="8" class="fill-accent-soft"/><text x="733" y="143" text-anchor="middle" class="label-strong">합 = 2</text>
+        <text x="788" y="143" class="label-accent">= x</text>
+        <text x="20" y="200" class="label-strong">channel 0</text>
+        <text x="20" y="218" class="label-dim">B가 not-taken인 칸</text>
+        <g>
+          <rect x="190" y="182" width="58" height="36" rx="8" class="fill-surface"/><text x="219" y="205" text-anchor="middle" class="label-dim">0</text>
+          <rect x="256" y="182" width="58" height="36" rx="8" class="fill-surface"/><text x="285" y="205" text-anchor="middle" class="label-dim">0</text>
+          <rect x="322" y="182" width="58" height="36" rx="8" class="fill-surface"/><text x="351" y="205" text-anchor="middle" class="label-dim">0</text>
+          <rect x="388" y="182" width="58" height="36" rx="8" class="fill-surface"/><text x="417" y="205" text-anchor="middle" class="label-dim">0</text>
+          <rect x="454" y="182" width="58" height="36" rx="8" class="fill-surface"/><text x="483" y="205" text-anchor="middle" class="label-dim">0</text>
+          <rect x="520" y="182" width="58" height="36" rx="8" class="fill-surface"/><text x="549" y="205" text-anchor="middle" class="label-dim">0</text>
+          <rect x="586" y="182" width="58" height="36" rx="8" class="fill-accent-soft"/><text x="615" y="205" text-anchor="middle" class="label-strong">1</text>
+        </g>
+        <path d="M650 200 H684" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+        <rect x="690" y="182" width="86" height="36" rx="8" class="fill-accent-soft"/><text x="733" y="205" text-anchor="middle" class="label-strong">합 = 1</text>
+        <text x="788" y="205" class="label-accent">= j</text>
+        <path d="M733 222 V264 H606" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+        <rect x="190" y="244" width="410" height="40" rx="8" class="fill-elevated"/>
+        <text x="395" y="269" text-anchor="middle" class="label">j ≥ x 인가? 1 ≥ 2는 거짓이므로 not-taken으로 예측</text>
+      </svg>
+      <figcaption><b>그림 4-2.</b> 세어서 예측하는 CNN. convolution 폭 1, 채널 2개, history 전체를 덮는 sum-pooling, 뉴런 하나로 이루어진다. 원문 Fig. 3의 CNN 부분을 다른 history 예로 다시 그림.</figcaption>
+    </figure>
+    <p>X로 적은 무관한 분기가 몇 개든, A가 어느 자리에 있든 두 합은 달라지지 않는다. 표 기반 예측기가 \(2^{30}\)가지로 보던 history가 숫자 두 개로 줄었다.</p>
+  </section>
+
+  <!-- ============================================================ 3 -->
+  <section id="architecture">
+    <h2>convolution과 sum-pooling: 자리를 버리고 횟수를 남긴다</h2>
+    <p><span class="term">CNN</span><span class="english">(Convolutional Neural Network)</span>은 입력의 여러 자리에서 같은 모양을 찾아내는 신경망이다. 분기예측에 쓸 때는 네 단계를 거친다.</p>
+    <ul>
+      <li><strong>입력 표현.</strong> history의 각 분기를 "주소의 하위 bit와 방향을 이어 붙인 정수"로 적는다. BranchNet은 이 정수를 <span class="term">embedding</span>으로 작은 벡터에 대응시킨다. 숫자의 크기 자체에는 뜻이 없기 때문이다.</li>
+      <li><strong><span class="term">convolution</span>.</strong> <span class="term">filter</span>라고 부르는 weight 묶음을 history의 모든 자리에 차례로 대어 본다. 찾는 분기 패턴이 있는 자리에서 0이 아닌 값을 낸다. filter 하나의 출력열을 channel이라고 한다.</li>
+      <li><strong><span class="term">sum-pooling</span>.</strong> channel의 이웃한 출력을 일정한 폭씩 더한다. 결과는 "그 구간에서 특징이 몇 번 나왔는가"다. 구간 안의 정확한 자리는 버려진다.</li>
+      <li><strong><span class="term">fully-connected</span> 층.</strong> 횟수들을 받아 taken인지 not-taken인지를 정한다.</li>
+    </ul>
+    <p>아래 실험에서 이 네 단계를 손으로 움직여 보자. filter는 하나뿐이고, "A가 taken"인 칸에서만 1을 낸다.</p>
+
+    <div class="simulator" id="simulator-pooling">
+      <div class="simulator-head"><span class="simulator-tag">실험 2</span><h3>convolution과 sum-pooling을 손으로</h3></div>
+      <div class="simulator-body">
+        <div class="simulator-view padded">
+          <div class="pooling-stage">
+            <div class="pooling-step-title"><b>① history</b>분기 B를 예측하기 직전의 (분기, 방향) 12개. 왼쪽이 오래된 분기다. 칸을 누르면 A가 그 자리로 옮겨 간다.</div>
+            <div class="pooling-grid" id="pooling-history" role="group" aria-label="history의 token 12개"></div>
+            <div class="pooling-step-title"><b>② convolution 출력</b>filter는 "A가 taken"인 칸에서만 1을 낸다.</div>
+            <div class="pooling-grid" id="pooling-response" aria-live="polite"></div>
+            <div class="pooling-step-title"><b>③ sum-pooling 출력</b>구간마다 1의 개수를 더한다.</div>
+            <div class="pooling-grid" id="pooling-pooled" aria-live="polite"></div>
+            <div class="pooling-step-title"><b>④ 예측</b>더한 값이 1 이상이면 taken이라고 답한다.</div>
+            <div class="pooling-decision" id="pooling-decision" aria-live="polite"></div>
+          </div>
+        </div>
+        <div class="simulator-controls inline">
+          <label class="control"><span>A의 자리 <output id="pooling-position-output"></output></span><input type="range" id="pooling-position" min="1" max="12" step="1" value="4"></label>
+          <div class="control"><span>A의 방향</span><div class="segmented" id="pooling-direction"><button data-value="taken" class="on">taken</button><button data-value="not-taken">not-taken</button></div></div>
+          <div class="control"><span>pooling 폭</span><div class="segmented" id="pooling-width"><button data-value="12" class="on">12 (전체)</button><button data-value="4">4</button><button data-value="2">2</button></div></div>
+          <div class="control"><span>무관한 분기</span><div class="control-row"><button class="button" id="pooling-shuffle">noise 다시 뽑기</button></div></div>
+        </div>
+      </div>
+      <div class="simulator-readout">
+        <div class="statistic"><span class="statistic-label">A의 자리</span><span class="statistic-value" id="pooling-place">—</span></div>
+        <div class="statistic"><span class="statistic-label">sum-pooling 출력</span><span class="statistic-value" id="pooling-feature">—</span></div>
+        <div class="statistic"><span class="statistic-label">B의 예측</span><span class="statistic-value" id="pooling-prediction">—</span></div>
+        <div class="statistic"><span class="statistic-label">방향만 이은 history</span><span class="statistic-value" id="pooling-pattern">—</span></div>
+      </div>
+      <div class="simulator-note"><b>설명용 모델.</b> filter 하나, convolution 폭 1, weight는 손으로 정했다. 실제 BranchNet은 filter와 마지막 층의 weight를 학습으로 얻고, 여러 채널과 여러 길이의 history를 함께 쓴다. <b>해 볼 것.</b> A의 자리를 끝에서 끝까지 옮겨 보자. ②의 1은 따라 움직이지만 pooling 폭이 12일 때 ③의 값과 ④의 예측은 그대로다. 마지막 칸 "방향만 이은 history"는 매번 달라진다. 폭을 4나 2로 줄이면 ③이 A의 대략적인 자리를 다시 드러낸다.</div>
+    </div>
+    <p>pooling 폭은 "자리를 얼마나 버릴 것인가"를 정하는 손잡이다. 폭이 넓으면 자리가 흔들려도 출력이 같아서 noise에 강하다. 대신 "A가 최근에 나왔는가, 오래전에 나왔는가"는 알 수 없게 된다. 폭이 좁으면 그 반대다. BranchNet은 이 손잡이를 history의 깊이에 맞춰 쓴다.</p>
+
+    <h3>Big-BranchNet의 구조</h3>
+    <p>논문의 큰 모델인 <span class="term">Big-BranchNet</span>은 특징을 뽑는 부분망 다섯 개와 fully-connected 층 두 개로 이루어진다. 논문은 부분망을 <span class="term">slice</span>라고 부른다. slice마다 embedding, convolution, sum-pooling을 한 줄로 갖고, 서로 다른 길이의 history를 본다.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 372" role="img" aria-label="Big-BranchNet 구조. 길이가 다른 history를 보는 slice 다섯 개가 특징을 뽑고, fully-connected 층과 sigmoid 뉴런이 방향을 정한다">
+        <text x="95" y="30" text-anchor="middle" class="label-dim">입력 history</text>
+        <text x="245" y="30" text-anchor="middle" class="label-dim">Embedding</text>
+        <text x="380" y="30" text-anchor="middle" class="label-dim">1D convolution</text>
+        <text x="525" y="30" text-anchor="middle" class="label-dim">Sum-pooling</text>
+        <g>
+          <rect x="20" y="44" width="150" height="40" rx="8" class="fill-accent-soft"/><text x="95" y="69" text-anchor="middle" class="label">최근 42개 분기</text>
+          <path d="M173 64 H186" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+          <rect x="190" y="44" width="110" height="40" rx="8" class="fill-surface"/><text x="245" y="69" text-anchor="middle" class="label">벡터로 변환</text>
+          <path d="M303 64 H316" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+          <rect x="320" y="44" width="120" height="40" rx="8" class="fill-surface"/><text x="380" y="69" text-anchor="middle" class="label">filter 32개</text>
+          <path d="M443 64 H456" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+          <rect x="460" y="44" width="130" height="40" rx="8" class="fill-surface"/><text x="525" y="69" text-anchor="middle" class="label">3칸씩 더함</text>
+          <path d="M593 64 H626" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+        </g>
+        <g>
+          <rect x="20" y="98" width="150" height="40" rx="8" class="fill-accent-soft"/><text x="95" y="123" text-anchor="middle" class="label">최근 78개 분기</text>
+          <path d="M173 118 H186" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+          <rect x="190" y="98" width="110" height="40" rx="8" class="fill-surface"/><text x="245" y="123" text-anchor="middle" class="label">벡터로 변환</text>
+          <path d="M303 118 H316" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+          <rect x="320" y="98" width="120" height="40" rx="8" class="fill-surface"/><text x="380" y="123" text-anchor="middle" class="label">filter 32개</text>
+          <path d="M443 118 H456" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+          <rect x="460" y="98" width="130" height="40" rx="8" class="fill-surface"/><text x="525" y="123" text-anchor="middle" class="label">6칸씩 더함</text>
+          <path d="M593 118 H626" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+        </g>
+        <g>
+          <rect x="20" y="152" width="150" height="40" rx="8" class="fill-accent-soft"/><text x="95" y="177" text-anchor="middle" class="label">최근 150개 분기</text>
+          <path d="M173 172 H186" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+          <rect x="190" y="152" width="110" height="40" rx="8" class="fill-surface"/><text x="245" y="177" text-anchor="middle" class="label">벡터로 변환</text>
+          <path d="M303 172 H316" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+          <rect x="320" y="152" width="120" height="40" rx="8" class="fill-surface"/><text x="380" y="177" text-anchor="middle" class="label">filter 32개</text>
+          <path d="M443 172 H456" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+          <rect x="460" y="152" width="130" height="40" rx="8" class="fill-surface"/><text x="525" y="177" text-anchor="middle" class="label">12칸씩 더함</text>
+          <path d="M593 172 H626" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+        </g>
+        <g>
+          <rect x="20" y="206" width="150" height="40" rx="8" class="fill-accent-soft"/><text x="95" y="231" text-anchor="middle" class="label">최근 294개 분기</text>
+          <path d="M173 226 H186" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+          <rect x="190" y="206" width="110" height="40" rx="8" class="fill-surface"/><text x="245" y="231" text-anchor="middle" class="label">벡터로 변환</text>
+          <path d="M303 226 H316" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+          <rect x="320" y="206" width="120" height="40" rx="8" class="fill-surface"/><text x="380" y="231" text-anchor="middle" class="label">filter 32개</text>
+          <path d="M443 226 H456" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+          <rect x="460" y="206" width="130" height="40" rx="8" class="fill-surface"/><text x="525" y="231" text-anchor="middle" class="label">24칸씩 더함</text>
+          <path d="M593 226 H626" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+        </g>
+        <g>
+          <rect x="20" y="260" width="150" height="40" rx="8" class="fill-accent-soft"/><text x="95" y="285" text-anchor="middle" class="label">최근 582개 분기</text>
+          <path d="M173 280 H186" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+          <rect x="190" y="260" width="110" height="40" rx="8" class="fill-surface"/><text x="245" y="285" text-anchor="middle" class="label">벡터로 변환</text>
+          <path d="M303 280 H316" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+          <rect x="320" y="260" width="120" height="40" rx="8" class="fill-surface"/><text x="380" y="285" text-anchor="middle" class="label">filter 32개</text>
+          <path d="M443 280 H456" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+          <rect x="460" y="260" width="130" height="40" rx="8" class="fill-surface"/><text x="525" y="285" text-anchor="middle" class="label">48칸씩 더함</text>
+          <path d="M593 280 H626" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+        </g>
+        <rect x="630" y="44" width="100" height="256" rx="8" class="fill-surface"/>
+        <text x="680" y="160" text-anchor="middle" class="label-strong">Fully-</text>
+        <text x="680" y="180" text-anchor="middle" class="label-strong">connected</text>
+        <text x="680" y="200" text-anchor="middle" class="label-dim">(hidden 층)</text>
+        <path d="M733 172 H756" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+        <rect x="760" y="142" width="84" height="60" rx="8" class="fill-accent-soft"/>
+        <text x="802" y="167" text-anchor="middle" class="label-strong">Sigmoid</text>
+        <text x="802" y="187" text-anchor="middle" class="label-dim">뉴런 1개</text>
+        <path d="M802 205 V228" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+        <text x="802" y="248" text-anchor="middle" class="label">taken일</text>
+        <text x="802" y="266" text-anchor="middle" class="label">확률</text>
+        <path d="M20 318 H590" class="stroke-line"/><text x="305" y="342" text-anchor="middle" class="label-dim">특징 추출: slice 다섯 개가 서로 다른 길이의 history를 본다</text>
+        <path d="M630 318 H730" class="stroke-line"/><text x="680" y="342" text-anchor="middle" class="label-dim">분류</text>
+        <path d="M760 318 H844" class="stroke-line"/><text x="802" y="342" text-anchor="middle" class="label-dim">예측</text>
+      </svg>
+      <figcaption><b>그림 4-3.</b> Big-BranchNet의 구조. 분기 하나를 맡는 모델 하나의 그림이다. history 길이와 pooling 폭은 원문 Table I의 값이다. 원문 Fig. 5를 다시 그림.</figcaption>
+    </figure>
+    <p>두 가지 설계 선택이 눈에 띈다. 첫째, history 길이가 42, 78, 150, 294, 582로 대략 두 배씩 늘어난다. TAGE가 여러 길이의 history를 쓰는 것과 같은 발상이다. 둘째, history가 길수록 pooling 폭도 3에서 48까지 함께 넓어진다. 논문의 설명으로는 history는 깊이 들어갈수록 더 noisy해지므로, 깊은 곳의 특징일수록 자리를 더 과감하게 버려야 history가 밀리는 것을 견딘다.</p>
+    <p>Big-BranchNet의 convolution 폭은 7이다. 이웃한 분기 일곱 개까지를 한 묶음의 패턴으로 볼 수 있다는 뜻이다. 실험 2의 filter는 폭이 1이라 분기 하나만 본다.</p>
+  </section>
+
+  <!-- ============================================================ 4 -->
+  <section id="offline">
+    <h2>offline 학습, runtime 추론</h2>
+    <p>CNN의 weight는 많은 예제를 되풀이해 보며 조금씩 고쳐서 얻는다. 이 계산은 실행 중의 프로세서가 하기에는 너무 비싸다. 그래서 BranchNet은 학습과 예측을 떼어 놓는다. 학습은 프로그램을 내놓기 전에 <span class="term">offline</span>으로 하고, 실행 중(<span class="term">runtime</span>)에는 이미 얻은 weight로 추론만 한다.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 330" role="img" aria-label="BranchNet의 offline 학습 흐름과 runtime 추론 흐름">
+        <text x="20" y="28" class="label-strong">Offline: 실행 전에 한 번</text>
+        <rect x="20" y="42" width="190" height="64" rx="10" class="fill-accent-soft"/><text x="115" y="70" text-anchor="middle" class="label-strong">실행 기록 수집</text><text x="115" y="90" text-anchor="middle" class="label-dim">여러 입력으로 profile</text>
+        <path d="M213 74 H224" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+        <rect x="228" y="42" width="190" height="64" rx="10" class="fill-accent-soft"/><text x="323" y="70" text-anchor="middle" class="label-strong">분기별 CNN 학습</text><text x="323" y="90" text-anchor="middle" class="label-dim">어려운 분기마다 모델 하나</text>
+        <path d="M421 74 H432" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+        <rect x="436" y="42" width="190" height="64" rx="10" class="fill-accent-soft"/><text x="531" y="70" text-anchor="middle" class="label-strong">개선이 큰 분기 선택</text><text x="531" y="90" text-anchor="middle" class="label-dim">다른 입력에서 효과를 측정</text>
+        <path d="M629 74 H640" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+        <rect x="644" y="42" width="196" height="64" rx="10" class="fill-accent-soft"/><text x="742" y="70" text-anchor="middle" class="label-strong">모델을 실행 파일에 첨부</text><text x="742" y="90" text-anchor="middle" class="label-dim">iso-latency 구성은 최대 41개</text>
+        <text x="20" y="150" class="label-strong">Runtime: 실행 중, 학습 없음</text>
+        <rect x="20" y="190" width="190" height="64" rx="10" class="fill-surface"/><text x="115" y="218" text-anchor="middle" class="label-strong">OS가 모델을 적재</text><text x="115" y="238" text-anchor="middle" class="label-dim">프로그램을 올릴 때</text>
+        <path d="M213 222 H224" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+        <rect x="228" y="190" width="190" height="64" rx="10" class="fill-surface"/><text x="323" y="218" text-anchor="middle" class="label-strong">분기 주소 확인</text><text x="323" y="238" text-anchor="middle" class="label-dim">모델이 있는 분기인가?</text>
+        <path d="M421 210 L466 186" class="stroke-line" marker-end="url(#correlation-arrow)"/><text x="436" y="186" text-anchor="middle" class="label-dim">예</text>
+        <path d="M421 234 L466 260" class="stroke-line" marker-end="url(#correlation-arrow)"/><text x="430" y="266" text-anchor="middle" class="label-dim">아니오</text>
+        <rect x="470" y="158" width="220" height="56" rx="10" class="fill-accent-soft"/><text x="580" y="182" text-anchor="middle" class="label-strong">Mini-BranchNet 추론</text><text x="580" y="202" text-anchor="middle" class="label-dim">선택된 소수의 분기만</text>
+        <rect x="470" y="232" width="220" height="56" rx="10" class="fill-surface"/><text x="580" y="256" text-anchor="middle" class="label-strong">TAGE-SC-L</text><text x="580" y="276" text-anchor="middle" class="label-dim">나머지 모든 분기</text>
+        <path d="M693 186 L736 210" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+        <path d="M693 260 L736 236" class="stroke-line" marker-end="url(#correlation-arrow)"/>
+        <rect x="740" y="194" width="100" height="58" rx="10" class="fill-elevated"/><text x="790" y="228" text-anchor="middle" class="label-strong">방향 예측</text>
+        <text x="20" y="316" class="label-dim">두 줄은 서로 다른 시점이다. 실행 중에는 weight가 바뀌지 않는다.</text>
+      </svg>
+      <figcaption><b>그림 4-4.</b> 학습은 실행 전에, 추론은 실행 중에 일어난다. BranchNet은 소수의 어려운 분기만 맡고 나머지는 기존 예측기에 맡기는 hybrid 구조다. 원문 V-E절, V-F절과 Fig. 6의 흐름을 다시 그림.</figcaption>
+    </figure>
+    <p>논문의 학습 절차는 세 단계다. 먼저 검증용 입력에서 MPKI가 가장 높은 분기 100개를 고른다. 다음으로 그 분기마다 CNN 모델을 하나씩 학습시킨다. 마지막으로 검증용 입력에서 MPKI가 가장 많이 줄어든 분기의 모델만 골라 실행 파일에 붙인다. 논문의 실험에서는 학습에 Alberta 입력을, 분기 선택에 SPEC train 입력을, 최종 평가에 SPEC ref 입력을 썼다. 세 묶음은 서로 겹치지 않는다.</p>
+    <p>소수의 분기만 맡는 이유는 <a href="h2p.html">3장</a>에서 본 쏠림 때문이다. 논문의 Fig. 1은 벤치마크 대부분에서 분기 8개만 CNN으로 예측해도 MPKI가 눈에 띄게 줄고, 25개를 넘기면 추가 이득이 작아진다고 보고한다.</p>
+
+    <h3>Big과 Mini</h3>
+    <p>Big-BranchNet은 소프트웨어 모델이다. 논문은 이것을 실제 예측기로 쓰자고 제안하지 않는다. CNN으로 얼마나 더 맞힐 수 있는지, 곧 상한을 재는 데 쓴다. 칩에 넣을 수 있게 줄인 것이 <span class="term">Mini-BranchNet</span>이다. 줄이는 방법은 네 가지다.</p>
+    <ul>
+      <li><strong>convolution 결과를 미리 쌓아 둔다.</strong> 분기가 history에 들어올 때마다 convolution과 pooling을 한 번씩 계산해 버퍼에 넣는다. 예측할 때는 버퍼를 골라 fully-connected 층 두 개만 계산한다.</li>
+      <li><strong>convolution을 표 조회로 바꾼다.</strong> 이웃한 분기 3개의 hash로 표를 읽으면 0 또는 1이 나온다. 실행 중에는 곱셈이 필요 없다.</li>
+      <li><strong>sum-pooling을 누적 합 register로 구현한다.</strong> 짧은 history는 정확한 구간 합을, 긴 history는 일정 주기로 끊어 더한 합을 쓴다.</li>
+      <li><strong>fully-connected 층을 3–4 bit 정수로 계산한다.</strong></li>
+    </ul>
+    <div class="table-wrap"><table>
+      <thead><tr><th>설정값</th><th>Big-BranchNet</th><th>Mini 2KB</th><th>Mini 1KB</th><th>Mini 0.5KB</th><th>Mini 0.25KB</th></tr></thead>
+      <tbody>
+        <tr><td><strong>history 길이</strong></td><td>42, 78, 150, 294, 582</td><td colspan="3">37, 77, 152, 302, 603</td><td>44, 92, 182</td></tr>
+        <tr><td><strong>convolution 채널 수</strong></td><td>32, 32, 32, 32, 32</td><td>4, 5, 5, 4, 4</td><td>3, 3, 4, 4, 3</td><td>3, 3, 3, 2, 2</td><td>2, 2, 2</td></tr>
+        <tr><td><strong>pooling 폭</strong></td><td>3, 6, 12, 24, 48</td><td colspan="3">7, 15, 30, 60, 120</td><td>7, 15, 30</td></tr>
+        <tr><td><strong>convolution 폭</strong></td><td class="number">7</td><td class="number">3</td><td class="number">3</td><td class="number">3</td><td class="number">3</td></tr>
+        <tr><td><strong>hidden 뉴런 수</strong></td><td class="number">128, 128</td><td class="number">10</td><td class="number">8</td><td class="number">6</td><td class="number">4</td></tr>
+        <tr><td><strong>용도</strong></td><td>상한 측정용 소프트웨어 모델</td><td colspan="4">추론 엔진과 함께 설계한 실행용 모델. 분기마다 필요한 크기를 골라 쓴다.</td></tr>
+      </tbody>
+    </table></div>
+    <p>표의 값은 원문 Table I에서 옮겼다. 분기 하나에 쓰는 저장 공간이 2KB에서 0.25KB까지 네 가지인 것은, 어떤 분기는 큰 모델이 있어야 맞고 어떤 분기는 작은 모델로 충분하기 때문이다. 1KB 구성의 내역은 convolution 표 0.53KB, pooling 버퍼 0.15KB(정확한 방식 0.11KB, 주기 방식 0.04KB), fully-connected weight 0.29KB다(원문 Table II).</p>
+
+    <h3>새 입력에서도 통하는 상관이어야 한다</h3>
+    <p>offline 학습에는 조건이 하나 붙는다. 학습 때 본 입력과 실제로 돌릴 입력이 다르다. 그러니 모델이 배운 관계가 <em>입력이 바뀌어도 성립하는 관계</em>여야 한다. 논문은 이것을 대표성과 coverage의 차이로 설명한다. 학습 입력이 실제 입력과 닮을 필요는 없다. 대신 학습 입력이 분기의 여러 행동을 고루 드러내야 한다.</p>
+    <p>논문은 앞의 예제 코드로 이 점을 실험했다. 학습 입력 세 가지를 만들었다. 첫째는 <code>N</code>이 항상 10이고 A가 항상 not-taken인 입력, 둘째는 <code>N</code>이 5에서 10 사이이고 A가 항상 not-taken인 입력, 셋째는 <code>N</code>이 1에서 4 사이이고 A가 절반의 확률로 not-taken인 입력이다. 시험은 <code>N</code>이 5에서 10 사이인 실행에서 A의 not-taken 확률 α를 0.2부터 1까지 바꿔 가며 했다. 아래 실험은 같은 설정을 아주 작은 모델로 흉내 낸 것이다.</p>
+
+    <div class="simulator" id="simulator-general">
+      <div class="simulator-head"><span class="simulator-tag">실험 3</span><h3>한 입력에서 배우고 다른 입력에서 시험하기</h3></div>
+      <div class="simulator-body side">
+        <div class="simulator-view">
+          <div class="legend"><span><i class="line" style="background:var(--series-1)"></i>①로 학습</span><span><i class="line" style="background:var(--series-2)"></i>②로 학습</span><span><i class="line" style="background:var(--series-3)"></i>③으로 학습</span><span><i class="line" style="background:var(--series-4)"></i>항상 not-taken</span></div>
+          <canvas id="general-chart-canvas" data-height="250" aria-label="시험 입력의 α에 따른 정확도. 학습 입력 세 가지와 항상 not-taken"></canvas>
+          <div class="legend" style="padding-top: 12px"><span><i style="background:var(--taken)"></i>taken 쪽으로 미는 weight</span><span><i style="background:var(--not-taken)"></i>not-taken 쪽으로 미는 weight</span></div>
+          <canvas id="general-weight-canvas" data-height="210" aria-label="선택한 학습 입력으로 얻은 token별 weight 막대"></canvas>
+        </div>
+        <div class="simulator-controls">
+          <div class="control"><span>학습 입력</span><div class="segmented" id="general-training"><button data-value="0">① N = 10, α = 1</button><button data-value="1" class="on">② N = 5–10, α = 1</button><button data-value="2">③ N = 1–4, α = 0.5</button></div></div>
+          <label class="control"><span>시험 입력의 α <output id="general-alpha-output"></output></span><input type="range" id="general-alpha" min="20" max="100" step="10" value="60"></label>
+        </div>
+      </div>
+      <div class="simulator-readout">
+        <div class="statistic"><span class="statistic-label">학습 입력에서의 정확도</span><span class="statistic-value" id="general-training-accuracy">—</span></div>
+        <div class="statistic"><span class="statistic-label">시험 입력에서의 정확도</span><span class="statistic-value" id="general-test-accuracy">—</span></div>
+        <div class="statistic"><span class="statistic-label">항상 not-taken이면</span><span class="statistic-value" id="general-baseline">—</span></div>
+        <div class="statistic wide"><span class="statistic-label">모델이 배운 "B가 taken이 되는 조건" (x는 A의 not-taken 횟수, N − x는 A의 taken 횟수, j는 B의 not-taken 횟수)</span><span class="statistic-value" id="general-rule">—</span></div>
+      </div>
+      <div class="simulator-note"><b>설명용 모델.</b> token마다 weight 하나를 두고 history 안의 token weight를 모두 더해 0 이상이면 taken이라고 답한다. 폭 1의 filter 하나, 전체 sum-pooling, 뉴런 하나와 같은 식이다. token은 A:T, A:N, 첫 루프의 반복 분기 L, 무관한 함수의 분기 U:T와 U:N, 지금까지의 B:N이다. 페이지를 열 때 경사 하강법으로 300번 고쳐 학습한다. 시험은 N이 5에서 10 사이인 실행 300번이다. 논문의 Fig. 4는 실제 CNN과 64KB TAGE-SC-L로 얻은 것이고, 이 실험의 숫자는 그 결과가 아니다. <b>해 볼 것.</b> 학습 입력 ②를 고르고 α를 1에서 0.2로 내려 보자. 그다음 ③으로 바꿔 보자.</div>
+    </div>
+    <p>②로 배운 모델은 학습 입력을 전부 맞힌다. 시험 입력에서도 α가 1이면 전부 맞힌다. 그런데 α가 1보다 작아지면 "항상 not-taken"과 같은 선으로 떨어진다. 막대를 보면 이유가 드러난다. 학습 입력에서 A는 한 번도 taken인 적이 없었다. 그래서 "A의 not-taken 횟수"와 "첫 루프의 반복 횟수"가 언제나 같은 값이었고, 모델은 둘을 구별할 근거가 없어 weight를 반씩 나눠 가졌다. 아래 식의 N − x 앞 계수가 0.5 근처인 것이 그 흔적이다. 논문의 표현으로는 "둘째 루프의 길이가 첫째 루프의 길이와 같다"고 배운 것이다.</p>
+    <p>③으로 배운 모델은 N − x 앞의 계수가 0에 가깝고 x 앞의 계수가 1에 가깝다. 곧 <code>j ≥ x</code>를 배웠다. 그래서 α가 얼마든 맞힌다. 주목할 점은 ③의 학습 입력에서 <code>N</code>이 1에서 4였고 시험에서는 5에서 10이었다는 것이다. 학습 때 본 적이 없는 길이의 history인데도 통한다. 외운 것이 패턴이 아니라 관계이기 때문이다.</p>
+    <div class="callout evidence">
+      <strong>논문이 보고한 값</strong>
+      <p>원문 Fig. 4에서 첫째와 둘째 입력으로 학습한 CNN은 64KB TAGE-SC-L보다도 정확도가 낮았고, α가 1보다 작을 때 특히 그랬다. 셋째 입력으로 학습한 CNN은 모든 α에서 Branch B를 100% 맞혔다. 또 원문 Fig. 12는 학습에 쓰는 입력과 구간을 늘릴수록 MPKI 감소가 커지다가, coverage가 충분해지면 추가 입력의 효과가 줄어든다고 보고한다.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ 5 -->
+  <section id="results">
+    <h2>논문이 보고한 결과</h2>
+    <p>평가는 SPEC2017 Integer Speed 벤치마크 10개에서 했다. 수치는 모두 학습에 쓰지 않은 SPEC ref 입력에서 잰 것이다. 설정이 여럿이므로 무엇을 무엇과 비교했는지부터 나눠 보자.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>설정</th><th>비교 기준</th><th>MPKI 감소</th><th>IPC 향상</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Big-BranchNet 상한</strong><br>unlimited MTAGE-SC에 Big-BranchNet을 더함</td><td>unlimited MTAGE-SC</td><td>평균 7.6% (3.42 → 3.16)<br>최대 15.7%</td><td>측정 대상 아님</td></tr>
+        <tr><td><strong>iso-storage</strong><br>8KB Mini-BranchNet + 56KB TAGE-SC-L</td><td>64KB TAGE-SC-L</td><td>평균 5.5%<br>최대 9.5%</td><td>평균 0.6%<br>최대 3.9%</td></tr>
+        <tr><td><strong>iso-latency</strong><br>32KB Mini-BranchNet + 64KB TAGE-SC-L</td><td>64KB TAGE-SC-L</td><td>평균 9.6%<br>최대 17.7%</td><td>기하평균 1.3%<br>최대 7.9%</td></tr>
+        <tr><td><strong>Big-BranchNet을 4-cycle로 쓸 수 있다면</strong><br>실수 연산 모델을 그대로 쓴다는 가정</td><td>64KB TAGE-SC-L</td><td>원문에 수치 없음</td><td>평균 2.9%<br>최대 19.0%</td></tr>
+      </tbody>
+    </table></div>
+    <div class="callout caution">
+      <strong>baseline을 확인하고 읽는다</strong>
+      <p>아래 세 줄(원문 Fig. 11)의 baseline은 Statistical Corrector의 local history 구성요소를 끈 64KB TAGE-SC-L이다. 논문은 실제 프로세서가 speculative local history를 유지하기 어렵다는 이유를 든다. IPC는 4KB gshare를 1-cycle 예측기로, TAGE-SC-L과 BranchNet을 4-cycle 예측기로 둔 코어 모델에서 쟀다. 마지막 줄의 수치는 원문 문장이 지표 이름을 적지 않았는데, Fig. 11의 IPC 그래프에서 축을 넘은 막대의 표기 19.0%와 일치한다.</p>
+    </div>
+    <p>평균보다 중요한 것은 벤치마크 사이의 차이다. 아래 그림은 첫 줄, 곧 상한 측정의 벤치마크별 값이다.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 330" role="img" aria-label="벤치마크별 MPKI 감소율 막대. leela 15.7퍼센트, xz 8.7퍼센트, mcf 6.5퍼센트, gcc와 perlbench와 xalancbmk는 0퍼센트">
+        <text x="140" y="22" class="label-dim">unlimited MTAGE-SC 대비 MPKI 감소율 (%)</text>
+        <g>
+          <text x="126" y="48" text-anchor="end" class="label-mono">mcf</text><rect x="140" y="34" width="244" height="20" rx="4" class="fill-accent"/><text x="392" y="48" class="label-mono">6.5</text>
+          <text x="126" y="74" text-anchor="end" class="label-mono">leela</text><rect x="140" y="60" width="589" height="20" rx="4" class="fill-accent"/><text x="737" y="74" class="label-mono">15.7</text>
+          <text x="126" y="100" text-anchor="end" class="label-mono">xz</text><rect x="140" y="86" width="326" height="20" rx="4" class="fill-accent"/><text x="474" y="100" class="label-mono">8.7</text>
+          <text x="126" y="126" text-anchor="end" class="label-mono">deepsjeng</text><rect x="140" y="112" width="143" height="20" rx="4" class="fill-accent"/><text x="291" y="126" class="label-mono">3.8</text>
+          <text x="126" y="152" text-anchor="end" class="label-mono">gcc</text><rect x="140" y="138" width="2" height="20" class="fill-accent"/><text x="150" y="152" class="label-mono">0.0</text>
+          <text x="126" y="178" text-anchor="end" class="label-mono">omnetpp</text><rect x="140" y="164" width="49" height="20" rx="4" class="fill-accent"/><text x="197" y="178" class="label-mono">1.3</text>
+          <text x="126" y="204" text-anchor="end" class="label-mono">exchange2</text><rect x="140" y="190" width="4" height="20" class="fill-accent"/><text x="152" y="204" class="label-mono">0.1</text>
+          <text x="126" y="230" text-anchor="end" class="label-mono">x264</text><rect x="140" y="216" width="56" height="20" rx="4" class="fill-accent"/><text x="204" y="230" class="label-mono">1.5</text>
+          <text x="126" y="256" text-anchor="end" class="label-mono">perlbench</text><rect x="140" y="242" width="2" height="20" class="fill-accent"/><text x="150" y="256" class="label-mono">0.0</text>
+          <text x="126" y="282" text-anchor="end" class="label-mono">xalancbmk</text><rect x="140" y="268" width="2" height="20" class="fill-accent"/><text x="150" y="282" class="label-mono">0.0</text>
+          <text x="126" y="312" text-anchor="end" class="label-strong">평균</text><rect x="140" y="298" width="285" height="20" rx="4" class="fill-accent-soft"/><text x="433" y="312" class="label-mono">7.6</text>
+        </g>
+        <path d="M140 30 V322" class="stroke-line"/>
+      </svg>
+      <figcaption><b>그림 4-5.</b> unlimited MTAGE-SC에 Big-BranchNet을 더했을 때의 MPKI 감소율. SPEC2017 Integer Speed, SPEC ref 입력. 원문 Fig. 9의 막대 위 수치를 다시 그림.</figcaption>
+    </figure>
+    <p>leela, xz, mcf, deepsjeng에서 이득이 크고 나머지에서는 작거나 없다. 논문이 든 이유는 벤치마크마다 다르다.</p>
+    <ul>
+      <li><strong>leela.</strong> 오예측이 많은 분기 대부분이 바둑판의 성질에 따라 갈린다. 같은 성질을 검사한 다른 분기가 history에 있지만 무관한 분기도 많아 history가 noisy하다. BranchNet은 상관 있는 분기만 세어서 이를 피한다.</li>
+      <li><strong>mcf.</strong> 오예측은 주로 정렬 함수 <code>qsort</code>에서 난다. 비교 함수 안의 분기는 정렬되지 않은 배열의 값에 달려 있어 BranchNet도 개선하지 못한다. 대신 <code>qsort</code> 본체에는 그 비교 결과에 따라 갈리는 분기가 많고, BranchNet은 이쪽을 개선한다.</li>
+      <li><strong>omnetpp.</strong> 주된 어려운 분기가 데이터에 의존하는 분기여서 이득이 작다.</li>
+      <li><strong>gcc.</strong> 코드가 크고 실행 구간이 다양해서 오예측이 아주 많은 분기에 고르게 퍼져 있다. 몇 개의 분기를 고치는 방식으로는 줄일 것이 없다.</li>
+      <li><strong>exchange2, x264, perlbench, xalancbmk.</strong> 어려운 분기 자체가 많지 않다.</li>
+    </ul>
+    <div class="callout evidence">
+      <strong>분기 하나하나의 변화</strong>
+      <p>원문 Fig. 10에서 leela의 네 번째 분기와 mcf의 위쪽 두 분기는 64KB TAGE-SC-L의 정확도가 79.1%, 73.9%, 67.4%였고, Big-BranchNet에서는 99.98%, 98.4%, 98.6%가 되었다. 저장 공간에 제한이 없는 MTAGE-SC도 같은 분기를 91.4%, 78.9%, 82.6%로 맞히는 데 그쳤다. Big-BranchNet이 개선한 분기는 벤치마크당 평균 19개이고, leela는 71개, gcc와 xalancbmk와 perlbench는 0개다.</p>
+    </div>
+    <p>논문의 Fig. 1은 조금 다른 질문에 답한다. 64KB TAGE-SC-L 옆에 큰 CNN을 두어 분기를 50개까지 맡기면 MPKI가 평균 19.1% 줄어든다. 논문은 이 값을 "오예측 가운데 noisy history 때문에 생기는 몫"의 근사로 읽는다. 나머지는 데이터에 의존하거나 본래 예측할 수 없는 분기의 몫이라는 해석이다.</p>
+  </section>
+
+  <!-- ============================================================ 6 -->
+  <section id="limits">
+    <h2>비용과 한계</h2>
+    <p>BranchNet은 TAGE와 같은 입력을 더 잘 요약하는 기법이다. 그래서 한계도 입력에서 나온다.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>분기의 성질</th><th>BranchNet의 효과</th><th>이유</th></tr></thead>
+      <tbody>
+        <tr><td>답을 알려 주는 분기가 history에 있고, noise에 묻혀 있다</td><td>크다</td><td>상관 있는 분기만 골라 센다. leela와 mcf의 개선된 분기가 여기에 든다.</td></tr>
+        <tr><td>결과가 오래전에 메모리에 저장된 값에 달려 있다</td><td>없다</td><td>최근 history의 어떤 분기도 그 값을 알려 주지 않는다. 논문은 이런 분기를 기존 예측기에 맡긴다.</td></tr>
+        <tr><td>오예측이 수많은 분기에 얇게 퍼져 있다</td><td>작다</td><td>분기마다 모델이 하나씩 필요하다. 추론 엔진이 담을 수 있는 분기 수에는 한도가 있다.</td></tr>
+        <tr><td>학습 입력에서만 성립하는 관계를 따른다</td><td>해로울 수 있다</td><td>실험 3의 ②처럼 새 입력에서 틀린 규칙을 적용한다. 그래서 검증용 입력에서 효과를 확인한 분기만 고른다.</td></tr>
+      </tbody>
+    </table></div>
+    <p>비용도 따로 적어 둘 만하다.</p>
+    <ul>
+      <li><strong>학습 비용.</strong> 논문의 환경에서 벤치마크 하나의 모델을 모두 학습하는 데 GPU 4개로 6시간에서 18시간이 걸렸다. 프로그램이 바뀌면 다시 해야 한다.</li>
+      <li><strong>저장 공간.</strong> iso-latency 구성은 64KB TAGE-SC-L에 32KB를 더한다. 논문은 32KB를 넘기면 이득이 줄어든다고 보고 이 크기를 골랐다(원문 Fig. 13).</li>
+      <li><strong>배포 경로.</strong> 학습한 모델을 실행 파일에 붙이고, OS가 프로그램을 올리거나 문맥을 바꿀 때 모델을 칩의 추론 엔진에 적재해야 한다. 이를 위한 명령어도 필요하다. 논문은 이 부분의 상세한 설계와 평가를 후속 연구로 남겼다.</li>
+      <li><strong>지연.</strong> 논문은 Mini-BranchNet의 예측 지연을 64KB TAGE-SC-L과 같은 4 cycle로 추정한다. 빨라지는 것은 아니다. 답이 늦게 오는 문제는 <a href="latency.html">9장</a>에서 다룬다.</li>
+      <li><strong>Big과 Mini의 격차.</strong> 원문 Table IV는 leela의 MPKI 감소율이 Big-BranchNet 35.8%에서, 분기 수 제한(25.1%), 작은 구조(20.0%), convolution 양자화(18.7%), 전체 양자화(15.7%)를 거치며 줄어드는 과정을 보여 준다. 논문은 이 표가 본문의 다른 결과와 조금 다른 학습 설정에서 얻은 것이라고 밝힌다.</li>
+    </ul>
+    <div class="callout">
+      <strong>다음 장으로 이어지는 질문</strong>
+      <p>BranchNet이 손대지 못한 분기는 "history에 정보가 없는" 분기다. 논문 스스로도 가장 큰 약점으로 데이터에 의존하는 분기를 꼽는다. 이런 분기를 맞히려면 history 밖에서 정보를 가져와야 한다. <a href="value.html">5장</a>의 논문들이 그 일을 한다.</p>
+    </div>
+  </section>
+
+  <section id="summary" class="keypoints">
+    <h2>핵심 정리</h2>
+    <ol>
+      <li>noisy history에서는 상관 있는 분기가 있어도 history 전체의 모양이 매번 달라진다. 표 기반 예측기는 패턴마다 entry가 필요하고, 그 수는 noise 분기 하나마다 두 배가 된다.</li>
+      <li>convolution은 찾는 분기 패턴이 있는 자리를 표시하고, sum-pooling은 구간 안의 표시를 더해 횟수로 바꾼다. 자리를 버리는 대신 history가 밀리거나 섞여도 같은 값을 얻는다.</li>
+      <li>BranchNet은 학습을 offline으로 하고 실행 중에는 추론만 한다. 소수의 어려운 분기만 맡고 나머지는 TAGE-SC-L에 맡긴다.</li>
+      <li>offline 학습은 입력이 바뀌어도 성립하는 관계를 배울 때만 통한다. 필요한 것은 학습 입력이 실제 입력을 닮는 것이 아니라, 분기의 여러 행동을 고루 드러내는 것이다.</li>
+      <li>논문이 보고한 실행용 구성의 결과는 64KB TAGE-SC-L(local history SC 제외) 대비 MPKI 평균 9.6% 감소, IPC 기하평균 1.3% 향상이다. 이득은 leela와 mcf 같은 일부 벤치마크에 몰려 있다.</li>
+      <li>history에 정보가 없는 분기는 돕지 못한다. 학습, 분기별 모델의 저장, 모델을 칩에 싣는 경로가 비용으로 남는다.</li>
+    </ol>
+  </section>
+
+  <section id="quiz">
+    <h2>확인 퀴즈</h2>
+    <div class="quiz" id="chapter-quiz"></div>
+  </section>
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  const TEXT_ON_COLOR = "#ffffff";
+
+  /* ============================================================ 실험 1: noise 속에 묻힌 단서 */
+  (function setupNoiseExperiment() {
+    // 주소를 gshare의 history bit(아래쪽 16 bit)보다 위에 두어, 분기마다 표의 다른 구역을 쓰게 한다.
+    // 작은 표에서 서로 다른 분기가 같은 entry를 덮어쓰는 효과를 빼고, 패턴 수의 효과만 보기 위해서다.
+    const TARGET_ADDRESS = 0x10000;
+    const SIGNAL_ADDRESS = 0x20000;
+    const PADDING_BASE_ADDRESS = 0x30000;
+    const PADDING_ADDRESS_COUNT = 4;
+    const NOISE_BASE_ADDRESS = 0x30008;
+    const NOISE_ADDRESS_COUNT = 8;
+    const MAXIMUM_NOISE_COUNT = 10;
+    // 세는 구간은 A와 B 사이가 가장 멀 때(noise 10 + 폭 5)도 A를 포함해야 한다.
+    const WINDOW_LENGTH = 16;
+    // 실행 사이를 구간 길이만큼 띄워야 앞 실행의 A가 이번 실행의 구간에 섞이지 않는다.
+    const PADDING_LENGTH = 16;
+    const TRACE_BRANCH_COUNT = 14000;
+    const EXAMPLE_EXECUTION_COUNT = 4;
+    const TRACE_SEED = 20;
+    const TAKEN_PROBABILITY = 0.5;
+    const FEATURE_MAXIMUM = 3;
+    const COUNTER_MAXIMUM = 3;
+    const COUNTER_TAKEN_THRESHOLD = 2;
+    const COUNTER_INITIAL_VALUE = 1;
+    const GSHARE_OPTIONS = { indexBits: 18, historyLength: 16 };
+    const TAGE_OPTIONS = { historyLengths: [4, 8, 16, 32], baseIndexBits: 10, tableIndexBits: 10, tagBits: 9 };
+    const CHART_MINIMUM_ACCURACY = 0.4;
+    // 100%에 붙은 선이 그림 위쪽 테두리에 가려지지 않도록 축을 조금 더 올린다.
+    const CHART_MAXIMUM_ACCURACY = 1.04;
+    const SERIES_NAMES = ["gshare", "TAGE", "횟수 세기"];
+
+    function buildTrace(noiseCount, jitter) {
+      const random = BranchBook.createRandom(TRACE_SEED + noiseCount * 97 + jitter * 13);
+      const trace = [];
+      const executions = [];
+      while (trace.length < TRACE_BRANCH_COUNT) {
+        for (let paddingIndex = 0; paddingIndex < PADDING_LENGTH; paddingIndex++) {
+          trace.push({ address: PADDING_BASE_ADDRESS + (paddingIndex % PADDING_ADDRESS_COUNT), taken: true });
+        }
+        const isSignalTaken = random() < TAKEN_PROBABILITY;
+        trace.push({ address: SIGNAL_ADDRESS, taken: isSignalTaken });
+        const gapLength = noiseCount + Math.floor(random() * (jitter + 1));
+        const noiseOutcomes = [];
+        for (let noiseIndex = 0; noiseIndex < gapLength; noiseIndex++) {
+          const isNoiseTaken = random() < TAKEN_PROBABILITY;
+          const noiseAddress = NOISE_BASE_ADDRESS + Math.floor(random() * NOISE_ADDRESS_COUNT);
+          trace.push({ address: noiseAddress, taken: isNoiseTaken });
+          noiseOutcomes.push(isNoiseTaken);
+        }
+        trace.push({ address: TARGET_ADDRESS, taken: isSignalTaken });
+        if (executions.length < EXAMPLE_EXECUTION_COUNT) executions.push({ isSignalTaken, noiseOutcomes });
+      }
+      return { trace, executions };
+    }
+
+    /** "최근 구간 안에서 A가 taken이었던 횟수"만 입력으로 쓰는 예측기. sum-pooling이 내는 값과 같은 것을 본다. */
+    function runCountingPredictor(trace) {
+      const counters = new Uint8Array(FEATURE_MAXIMUM + 1).fill(COUNTER_INITIAL_VALUE);
+      let targetCount = 0;
+      let correctCount = 0;
+      trace.forEach((branch, branchIndex) => {
+        if (branch.address !== TARGET_ADDRESS) return;
+        let signalTakenCount = 0;
+        const windowStart = Math.max(0, branchIndex - WINDOW_LENGTH);
+        for (let historyIndex = windowStart; historyIndex < branchIndex; historyIndex++) {
+          const pastBranch = trace[historyIndex];
+          if (pastBranch.address === SIGNAL_ADDRESS && pastBranch.taken) signalTakenCount++;
+        }
+        const feature = Math.min(signalTakenCount, FEATURE_MAXIMUM);
+        const isPredictedTaken = counters[feature] >= COUNTER_TAKEN_THRESHOLD;
+        targetCount++;
+        if (isPredictedTaken === branch.taken) correctCount++;
+        if (branch.taken) counters[feature] = Math.min(COUNTER_MAXIMUM, counters[feature] + 1);
+        else counters[feature] = Math.max(0, counters[feature] - 1);
+      });
+      return correctCount / targetCount;
+    }
+
+    function targetAccuracy(result) {
+      const record = result.perAddress.get(TARGET_ADDRESS);
+      return 1 - record.mispredictionCount / record.executionCount;
+    }
+
+    function evaluate(noiseCount, jitter) {
+      const built = buildTrace(noiseCount, jitter);
+      const gshareResult = BranchBook.runPredictor(BranchBook.predictors.createGshare(GSHARE_OPTIONS), built.trace);
+      const tageResult = BranchBook.runPredictor(BranchBook.predictors.createTage(TAGE_OPTIONS), built.trace);
+      return {
+        accuracies: [targetAccuracy(gshareResult), targetAccuracy(tageResult), runCountingPredictor(built.trace)],
+        executions: built.executions,
+      };
+    }
+
+    // 폭이 같으면 noise 슬라이더를 움직여도 곡선은 같다. 폭마다 한 번만 계산해 둔다.
+    const curveCache = new Map();
+    function curveFor(jitter) {
+      if (!curveCache.has(jitter)) {
+        const points = [];
+        for (let noiseCount = 0; noiseCount <= MAXIMUM_NOISE_COUNT; noiseCount++) points.push(evaluate(noiseCount, jitter));
+        curveCache.set(jitter, points);
+      }
+      return curveCache.get(jitter);
+    }
+
+    function countPatterns(noiseCount, jitter) {
+      let patternCount = 0;
+      for (let gapLength = noiseCount; gapLength <= noiseCount + jitter; gapLength++) patternCount += Math.pow(2, gapLength + 1);
+      return patternCount;
+    }
+
+    function refresh() {
+      const noiseCount = noiseControl.value;
+      const jitter = jitterControl.value;
+      const current = curveFor(jitter)[noiseCount];
+      BranchBook.setContent("noise-gshare", BranchBook.formatPercent(current.accuracies[0], 0));
+      BranchBook.setContent("noise-tage", BranchBook.formatPercent(current.accuracies[1], 0));
+      BranchBook.setContent("noise-counting", BranchBook.formatPercent(current.accuracies[2], 0));
+      BranchBook.setContent("noise-patterns", countPatterns(noiseCount, jitter).toLocaleString("en-US") + "<small>가지</small>");
+      historyCanvas.redraw();
+      chartCanvas.redraw();
+    }
+
+    const noiseControl = BranchBook.bindRange("noise-count", (value) => value + "개", refresh);
+    function formatJitter(value) {
+      if (value === 0) return "없음";
+      return "최대 " + value + "개 더";
+    }
+    const jitterControl = BranchBook.bindRange("noise-jitter", formatJitter, refresh);
+
+    const historyCanvas = BranchBook.createCanvas("noise-history-canvas", (context, width, height, palette) => {
+      const noiseCount = noiseControl.value;
+      const jitter = jitterControl.value;
+      const executions = curveFor(jitter)[noiseCount].executions;
+      const titleHeight = 22;
+      const rowHeight = (height - titleHeight) / EXAMPLE_EXECUTION_COUNT;
+      // 가장 긴 실행(A + noise 최대 + B)이 한 줄에 들어가도록 칸 크기를 정한다.
+      const maximumCellCount = noiseCount + jitter + 2;
+      const cellSize = Math.min(24, (width - 8) / maximumCellCount, rowHeight - 4);
+      // B를 같은 세로줄에 맞춰야 A의 자리가 실행마다 다른 것이 보인다.
+      const rightEdge = 2 + maximumCellCount * cellSize;
+      context.fillStyle = palette.textDim;
+      context.font = "12px " + palette.font;
+      context.textAlign = "left";
+      context.textBaseline = "middle";
+      context.fillText("실행 예 네 개. 색칠된 칸이 A, 오른쪽 끝이 B", 2, titleHeight / 2);
+      context.textAlign = "center";
+      executions.forEach((execution, executionIndex) => {
+        const cells = [{ label: "A", isSignal: true }];
+        execution.noiseOutcomes.forEach((isNoiseTaken) => cells.push({ label: isNoiseTaken ? "T" : "N", isSignal: false }));
+        cells.push({ label: "B", isSignal: true });
+        const y = titleHeight + executionIndex * rowHeight + (rowHeight - cellSize) / 2;
+        const signalColor = execution.isSignalTaken ? palette.taken : palette.notTaken;
+        cells.forEach((cell, cellIndex) => {
+          const x = rightEdge - (cells.length - cellIndex) * cellSize;
+          context.fillStyle = cell.isSignal ? signalColor : palette.surfaceStrong;
+          BranchBook.roundedRectangle(context, x + 1, y, cellSize - 2, cellSize - 2, 4);
+          context.fill();
+          context.fillStyle = cell.isSignal ? TEXT_ON_COLOR : palette.textDim;
+          context.font = (cell.isSignal ? "600 " : "") + Math.min(12, cellSize - 6) + "px " + palette.mono;
+          context.fillText(cell.label, x + cellSize / 2, y + (cellSize - 2) / 2 + 0.5);
+        });
+      });
+    });
+
+    let lastChart = null;
+    const chartCanvas = BranchBook.createCanvas("noise-chart-canvas", (context, width, height, palette) => {
+      const curve = curveFor(jitterControl.value);
+      const chart = BranchBook.drawChart(context, { x: 56, y: 14, width: width - 72, height: height - 62 }, {
+        xMinimum: 0, xMaximum: MAXIMUM_NOISE_COUNT, yMinimum: CHART_MINIMUM_ACCURACY, yMaximum: CHART_MAXIMUM_ACCURACY,
+        xTicks: [0, 2, 4, 6, 8, 10], yTicks: [0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1], xLabel: "A와 B 사이의 noise 분기 수", yLabel: "B를 맞힌 비율",
+        yFormat: (value) => Math.round(value * 100) + "%", xFormat: (value) => String(value),
+      });
+      lastChart = chart;
+      const markerX = chart.toX(noiseControl.value);
+      context.strokeStyle = palette.axis;
+      context.lineWidth = 1;
+      context.setLineDash([4, 4]);
+      context.beginPath();
+      context.moveTo(markerX, chart.bounds.y);
+      context.lineTo(markerX, chart.bounds.y + chart.bounds.height);
+      context.stroke();
+      context.setLineDash([]);
+      SERIES_NAMES.forEach((seriesName, seriesIndex) => {
+        const points = curve.map((point, noiseCount) => [noiseCount, Math.max(CHART_MINIMUM_ACCURACY, point.accuracies[seriesIndex])]);
+        BranchBook.drawLine(context, chart, points, palette.series[seriesIndex]);
+        const currentPoint = points[noiseControl.value];
+        context.fillStyle = palette.series[seriesIndex];
+        context.strokeStyle = palette.background;
+        context.lineWidth = 2;
+        context.beginPath();
+        context.arc(chart.toX(currentPoint[0]), chart.toY(currentPoint[1]), 5, 0, Math.PI * 2);
+        context.fill();
+        context.stroke();
+      });
+    });
+    BranchBook.attachTooltip("noise-chart-canvas", (x) => {
+      if (!lastChart) return null;
+      const bounds = lastChart.bounds;
+      if (x < bounds.x - 6 || x > bounds.x + bounds.width + 6) return null;
+      const noiseCount = BranchBook.clamp(Math.round(((x - bounds.x) / bounds.width) * MAXIMUM_NOISE_COUNT), 0, MAXIMUM_NOISE_COUNT);
+      const accuracies = curveFor(jitterControl.value)[noiseCount].accuracies;
+      const parts = SERIES_NAMES.map((seriesName, seriesIndex) => seriesName + " <b>" + BranchBook.formatPercent(accuracies[seriesIndex], 0) + "</b>");
+      return { x: lastChart.toX(noiseCount), y: lastChart.toY(Math.max(...accuracies)), html: "noise " + noiseCount + "개 · " + parts.join(" · ") };
+    });
+    refresh();
+  })();
+
+  /* ============================================================ 실험 2: convolution과 sum-pooling을 손으로 */
+  (function setupPoolingExperiment() {
+    const HISTORY_LENGTH = 12;
+    const NOISE_NAMES = ["x", "y", "z"];
+    const NOISE_SEED = 5;
+    const TAKEN_PROBABILITY = 0.5;
+    const DECISION_THRESHOLD = 1;
+    const PATTERN_GROUP_SIZE = 4;
+    const random = BranchBook.createRandom(NOISE_SEED);
+    let noiseTokens = [];
+
+    function drawNoiseTokens() {
+      noiseTokens = [];
+      for (let noiseIndex = 0; noiseIndex < HISTORY_LENGTH - 1; noiseIndex++) {
+        const name = NOISE_NAMES[Math.floor(random() * NOISE_NAMES.length)];
+        noiseTokens.push({ name, taken: random() < TAKEN_PROBABILITY, isSignal: false });
+      }
+    }
+
+    /** noise 11개의 순서는 그대로 두고, A를 지정한 자리에 끼워 넣은 history를 만든다. */
+    function buildHistory() {
+      const signalIndex = positionControl.value - 1;
+      const tokens = noiseTokens.slice();
+      tokens.splice(signalIndex, 0, { name: "A", taken: directionControl.value === "taken", isSignal: true });
+      return tokens;
+    }
+
+    function createCell(text, isActive, columnSpan) {
+      const cell = document.createElement("div");
+      cell.className = "pooling-cell";
+      if (isActive) cell.classList.add("active");
+      cell.textContent = text;
+      cell.style.gridColumn = "span " + columnSpan;
+      return cell;
+    }
+
+    function refresh() {
+      const tokens = buildHistory();
+      const responses = tokens.map((token) => (token.isSignal && token.taken ? 1 : 0));
+      const poolingWidth = Number(widthControl.value);
+      const pooledValues = [];
+      for (let windowStart = 0; windowStart < HISTORY_LENGTH; windowStart += poolingWidth) {
+        let windowSum = 0;
+        for (let offset = 0; offset < poolingWidth; offset++) windowSum += responses[windowStart + offset];
+        pooledValues.push(windowSum);
+      }
+      const featureTotal = pooledValues.reduce((total, value) => total + value, 0);
+      const isPredictedTaken = featureTotal >= DECISION_THRESHOLD;
+
+      const historyContainer = document.getElementById("pooling-history");
+      historyContainer.replaceChildren(...tokens.map((token, tokenIndex) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "pooling-token";
+        if (token.isSignal) button.classList.add("signal", token.taken ? "taken" : "not-taken");
+        const nameLine = document.createElement("span");
+        nameLine.textContent = token.name;
+        const directionLine = document.createElement("b");
+        directionLine.textContent = token.taken ? "T" : "N";
+        button.append(nameLine, directionLine);
+        button.setAttribute("aria-label", "자리 " + (tokenIndex + 1) + ": 분기 " + token.name + ", " + (token.taken ? "taken" : "not-taken"));
+        button.addEventListener("click", () => { positionControl.set(tokenIndex + 1); refresh(); });
+        return button;
+      }));
+      document.getElementById("pooling-response").replaceChildren(...responses.map((response) => createCell(String(response), response === 1, 1)));
+      document.getElementById("pooling-pooled").replaceChildren(...pooledValues.map((value) => createCell(String(value), value > 0, poolingWidth)));
+
+      const comparison = isPredictedTaken ? "≥" : "<";
+      const decision = document.getElementById("pooling-decision");
+      decision.innerHTML = "더한 값 <b>" + featureTotal + "</b> " + comparison + " " + DECISION_THRESHOLD + " 이므로 B를 " +
+        (isPredictedTaken ? '<span class="taken-text">taken</span>' : '<span class="not-taken-text">not-taken</span>') + "으로 예측한다.";
+
+      const stepsFromNewest = HISTORY_LENGTH - positionControl.value + 1;
+      BranchBook.setContent("pooling-place", "최근에서 " + stepsFromNewest + "<small>번째</small>");
+      BranchBook.setContent("pooling-feature", pooledValues.join(" · "));
+      BranchBook.setContent("pooling-prediction", isPredictedTaken ? "taken" : "not-taken");
+      const letters = tokens.map((token) => (token.taken ? "T" : "N"));
+      const groups = [];
+      for (let groupStart = 0; groupStart < HISTORY_LENGTH; groupStart += PATTERN_GROUP_SIZE) groups.push(letters.slice(groupStart, groupStart + PATTERN_GROUP_SIZE).join(""));
+      BranchBook.setContent("pooling-pattern", groups.join(" "));
+    }
+
+    const positionControl = BranchBook.bindRange("pooling-position", (value) => "왼쪽에서 " + value + "번째", refresh);
+    const directionControl = BranchBook.bindSegmented("pooling-direction", refresh);
+    const widthControl = BranchBook.bindSegmented("pooling-width", refresh);
+    BranchBook.bindButton("pooling-shuffle", () => { drawNoiseTokens(); refresh(); });
+    drawNoiseTokens();
+    refresh();
+  })();
+
+  /* ============================================================ 실험 3: 한 입력에서 배우고 다른 입력에서 시험하기 */
+  (function setupGeneralizationExperiment() {
+    const TOKEN_NAMES = ["A:T", "A:N", "L", "U:T", "U:N", "B:N"];
+    const TOKEN_DESCRIPTIONS = ["A가 taken", "A가 not-taken", "첫 루프 반복", "무관한 분기 T", "무관한 분기 N", "B가 not-taken"];
+    const TOKEN_SIGNAL_TAKEN = 0;
+    const TOKEN_SIGNAL_NOT_TAKEN = 1;
+    const TOKEN_LOOP = 2;
+    const TOKEN_UNCORRELATED_TAKEN = 3;
+    const TOKEN_UNCORRELATED_NOT_TAKEN = 4;
+    const TOKEN_TARGET_NOT_TAKEN = 5;
+    const UNCORRELATED_BRANCH_COUNT = 6;
+    const UNCORRELATED_TAKEN_PROBABILITY = 0.5;
+    const TRAINING_EXECUTION_COUNT = 200;
+    const TEST_EXECUTION_COUNT = 300;
+    const TRAINING_SEED = 3;
+    const TEST_SEED = 99;
+    const EPOCH_COUNT = 300;
+    const LEARNING_RATE = 0.2;
+    const TRAINING_INPUTS = [
+      { minimumIterations: 10, maximumIterations: 10, notTakenProbability: 1 },
+      { minimumIterations: 5, maximumIterations: 10, notTakenProbability: 1 },
+      { minimumIterations: 1, maximumIterations: 4, notTakenProbability: 0.5 },
+    ];
+    const TEST_MINIMUM_ITERATIONS = 5;
+    const TEST_MAXIMUM_ITERATIONS = 10;
+    const TEST_PERCENTAGES = [20, 30, 40, 50, 60, 70, 80, 90, 100];
+    const BASELINE_SERIES_INDEX = 3;
+    const CHART_MINIMUM_ACCURACY = 0.5;
+    // 100%에 붙은 선이 그림 위쪽 테두리에 가려지지 않도록 축을 조금 더 올린다.
+    const CHART_MAXIMUM_ACCURACY = 1.04;
+    const UNSELECTED_LINE_OPACITY = 0.6;
+    const WIDE_LABEL_CANVAS_WIDTH = 440;
+
+    /**
+     * 예제 프로그램을 executionCount번 돌려, B를 예측하는 순간마다의 token 횟수와 정답을 모은다.
+     * 한 번의 실행에서 B는 not-taken을 exitCount번 낸 뒤 taken이 된다.
+     */
+    function buildSamples(seed, executionCount, minimumIterations, maximumIterations, notTakenProbability) {
+      const random = BranchBook.createRandom(seed);
+      const samples = [];
+      for (let executionIndex = 0; executionIndex < executionCount; executionIndex++) {
+        const iterationCount = minimumIterations + Math.floor(random() * (maximumIterations - minimumIterations + 1));
+        let exitCount = 0;
+        for (let iteration = 0; iteration < iterationCount; iteration++) {
+          if (random() < notTakenProbability) exitCount++;
+        }
+        let uncorrelatedTakenCount = 0;
+        for (let branchIndex = 0; branchIndex < UNCORRELATED_BRANCH_COUNT; branchIndex++) {
+          if (random() < UNCORRELATED_TAKEN_PROBABILITY) uncorrelatedTakenCount++;
+        }
+        for (let targetNotTakenCount = 0; targetNotTakenCount <= exitCount; targetNotTakenCount++) {
+          const features = new Array(TOKEN_NAMES.length).fill(0);
+          features[TOKEN_SIGNAL_TAKEN] = iterationCount - exitCount;
+          features[TOKEN_SIGNAL_NOT_TAKEN] = exitCount;
+          features[TOKEN_LOOP] = iterationCount;
+          features[TOKEN_UNCORRELATED_TAKEN] = uncorrelatedTakenCount;
+          features[TOKEN_UNCORRELATED_NOT_TAKEN] = UNCORRELATED_BRANCH_COUNT - uncorrelatedTakenCount;
+          features[TOKEN_TARGET_NOT_TAKEN] = targetNotTakenCount;
+          samples.push({ features, isTaken: targetNotTakenCount === exitCount });
+        }
+      }
+      return samples;
+    }
+
+    function computeLogit(model, features) {
+      let logit = model.bias;
+      for (let tokenIndex = 0; tokenIndex < features.length; tokenIndex++) logit += model.weights[tokenIndex] * features[tokenIndex];
+      return logit;
+    }
+
+    /** weight를 모두 0에서 시작해, 전체 예제의 평균 기울기 방향으로 EPOCH_COUNT번 고친다. */
+    function trainModel(samples) {
+      const model = { weights: new Array(TOKEN_NAMES.length).fill(0), bias: 0 };
+      for (let epoch = 0; epoch < EPOCH_COUNT; epoch++) {
+        const weightGradients = new Array(TOKEN_NAMES.length).fill(0);
+        let biasGradient = 0;
+        samples.forEach((sample) => {
+          const probability = 1 / (1 + Math.exp(-computeLogit(model, sample.features)));
+          const error = probability - (sample.isTaken ? 1 : 0);
+          for (let tokenIndex = 0; tokenIndex < weightGradients.length; tokenIndex++) weightGradients[tokenIndex] += error * sample.features[tokenIndex];
+          biasGradient += error;
+        });
+        for (let tokenIndex = 0; tokenIndex < weightGradients.length; tokenIndex++) {
+          model.weights[tokenIndex] -= (LEARNING_RATE * weightGradients[tokenIndex]) / samples.length;
+        }
+        model.bias -= (LEARNING_RATE * biasGradient) / samples.length;
+      }
+      return model;
+    }
+
+    function measureAccuracy(model, samples) {
+      let correctCount = 0;
+      samples.forEach((sample) => {
+        const isPredictedTaken = computeLogit(model, sample.features) >= 0;
+        if (isPredictedTaken === sample.isTaken) correctCount++;
+      });
+      return correctCount / samples.length;
+    }
+
+    // 시험 입력은 학습 입력과 무관하게 고정한다. 모델 셋이 같은 시험 문제를 푼다.
+    const testSets = TEST_PERCENTAGES.map((percentage) =>
+      buildSamples(TEST_SEED + percentage, TEST_EXECUTION_COUNT, TEST_MINIMUM_ITERATIONS, TEST_MAXIMUM_ITERATIONS, percentage / 100));
+    const baselineAccuracies = testSets.map((samples) => samples.filter((sample) => !sample.isTaken).length / samples.length);
+    const trainedModels = TRAINING_INPUTS.map((input, inputIndex) => {
+      const samples = buildSamples(TRAINING_SEED + inputIndex, TRAINING_EXECUTION_COUNT, input.minimumIterations, input.maximumIterations, input.notTakenProbability);
+      const model = trainModel(samples);
+      return {
+        model,
+        trainingAccuracy: measureAccuracy(model, samples),
+        testAccuracies: testSets.map((testSamples) => measureAccuracy(model, testSamples)),
+      };
+    });
+
+    /**
+     * 배운 weight를 "j ≥ a·x + b·(N − x) + c" 꼴로 고쳐 쓴다.
+     * 첫 루프의 반복 횟수는 언제나 x + (N − x)이므로, L의 weight를 A:N과 A:T 양쪽에 나눠 더할 수 있다.
+     */
+    function describeRule(model) {
+      const targetWeight = model.weights[TOKEN_TARGET_NOT_TAKEN];
+      const exitCoefficient = -(model.weights[TOKEN_SIGNAL_NOT_TAKEN] + model.weights[TOKEN_LOOP]) / targetWeight;
+      const takenCoefficient = -(model.weights[TOKEN_SIGNAL_TAKEN] + model.weights[TOKEN_LOOP]) / targetWeight;
+      const averageUncorrelatedWeight = (model.weights[TOKEN_UNCORRELATED_TAKEN] + model.weights[TOKEN_UNCORRELATED_NOT_TAKEN]) / 2;
+      const constant = -(model.bias + UNCORRELATED_BRANCH_COUNT * averageUncorrelatedWeight) / targetWeight;
+      const constantSign = constant < 0 ? "−" : "+";
+      return "j ≥ " + exitCoefficient.toFixed(2) + "·x + " + takenCoefficient.toFixed(2) + "·(N − x) " + constantSign + " " + Math.abs(constant).toFixed(2);
+    }
+
+    function selectedIndex() { return Number(trainingControl.value); }
+    function alphaIndex() { return TEST_PERCENTAGES.indexOf(alphaControl.value); }
+
+    function refresh() {
+      const selected = trainedModels[selectedIndex()];
+      BranchBook.setContent("general-training-accuracy", BranchBook.formatPercent(selected.trainingAccuracy));
+      BranchBook.setContent("general-test-accuracy", BranchBook.formatPercent(selected.testAccuracies[alphaIndex()]));
+      BranchBook.setContent("general-baseline", BranchBook.formatPercent(baselineAccuracies[alphaIndex()]));
+      BranchBook.setContent("general-rule", describeRule(selected.model));
+      chartCanvas.redraw();
+      weightCanvas.redraw();
+    }
+
+    const trainingControl = BranchBook.bindSegmented("general-training", refresh);
+    const alphaControl = BranchBook.bindRange("general-alpha", (value) => (value / 100).toFixed(1), refresh);
+
+    let lastChart = null;
+    const chartCanvas = BranchBook.createCanvas("general-chart-canvas", (context, width, height, palette) => {
+      const chart = BranchBook.drawChart(context, { x: 56, y: 14, width: width - 72, height: height - 62 }, {
+        xMinimum: 0.2, xMaximum: 1, yMinimum: CHART_MINIMUM_ACCURACY, yMaximum: CHART_MAXIMUM_ACCURACY,
+        xTicks: 4, yTicks: [0.5, 0.6, 0.7, 0.8, 0.9, 1], xLabel: "시험 입력의 α (A가 not-taken일 확률)", yLabel: "B를 맞힌 비율",
+        yFormat: (value) => Math.round(value * 100) + "%", xFormat: (value) => value.toFixed(1),
+      });
+      lastChart = chart;
+      const toPoints = (accuracies) => accuracies.map((accuracy, percentageIndex) => [TEST_PERCENTAGES[percentageIndex] / 100, Math.max(CHART_MINIMUM_ACCURACY, accuracy)]);
+      BranchBook.drawLine(context, chart, toPoints(baselineAccuracies), palette.series[BASELINE_SERIES_INDEX], { dashed: true, lineWidth: 1.5 });
+      trainedModels.forEach((trained, inputIndex) => {
+        const isSelected = inputIndex === selectedIndex();
+        context.globalAlpha = isSelected ? 1 : UNSELECTED_LINE_OPACITY;
+        BranchBook.drawLine(context, chart, toPoints(trained.testAccuracies), palette.series[inputIndex], { lineWidth: isSelected ? 3.5 : 2 });
+        context.globalAlpha = 1;
+      });
+      const selectedAccuracy = Math.max(CHART_MINIMUM_ACCURACY, trainedModels[selectedIndex()].testAccuracies[alphaIndex()]);
+      context.fillStyle = palette.series[selectedIndex()];
+      context.strokeStyle = palette.background;
+      context.lineWidth = 2;
+      context.beginPath();
+      context.arc(chart.toX(alphaControl.value / 100), chart.toY(selectedAccuracy), 6, 0, Math.PI * 2);
+      context.fill();
+      context.stroke();
+    });
+    BranchBook.attachTooltip("general-chart-canvas", (x) => {
+      if (!lastChart) return null;
+      const bounds = lastChart.bounds;
+      if (x < bounds.x - 6 || x > bounds.x + bounds.width + 6) return null;
+      const lastIndex = TEST_PERCENTAGES.length - 1;
+      const percentageIndex = BranchBook.clamp(Math.round(((x - bounds.x) / bounds.width) * lastIndex), 0, lastIndex);
+      const parts = trainedModels.map((trained, inputIndex) => ["①", "②", "③"][inputIndex] + " <b>" + BranchBook.formatPercent(trained.testAccuracies[percentageIndex], 0) + "</b>");
+      parts.push("항상 N <b>" + BranchBook.formatPercent(baselineAccuracies[percentageIndex], 0) + "</b>");
+      const alpha = TEST_PERCENTAGES[percentageIndex] / 100;
+      return { x: lastChart.toX(alpha), y: lastChart.bounds.y + 30, html: "α " + alpha.toFixed(1) + " · " + parts.join(" · ") };
+    });
+
+    let weightRows = [];
+    const weightCanvas = BranchBook.createCanvas("general-weight-canvas", (context, width, height, palette) => {
+      const model = trainedModels[selectedIndex()].model;
+      const hasWideLabels = width >= WIDE_LABEL_CANVAS_WIDTH;
+      const labelWidth = hasWideLabels ? 150 : 44;
+      const valueWidth = 46;
+      const rowHeight = (height - 8) / TOKEN_NAMES.length;
+      const barHeight = Math.min(20, rowHeight - 8);
+      const plotLeft = labelWidth + 10;
+      const plotWidth = width - plotLeft - valueWidth - 4;
+      const zeroX = plotLeft + plotWidth / 2;
+      const largestMagnitude = Math.max(...model.weights.map((weight) => Math.abs(weight)), 0.01);
+      weightRows = [];
+      context.textBaseline = "middle";
+      model.weights.forEach((weight, tokenIndex) => {
+        const centerY = 4 + rowHeight * (tokenIndex + 0.5);
+        const barLength = (Math.abs(weight) / largestMagnitude) * (plotWidth / 2);
+        const barX = weight >= 0 ? zeroX : zeroX - barLength;
+        context.fillStyle = palette.surface;
+        BranchBook.roundedRectangle(context, plotLeft, centerY - barHeight / 2, plotWidth, barHeight, 4);
+        context.fill();
+        context.fillStyle = weight >= 0 ? palette.taken : palette.notTaken;
+        BranchBook.roundedRectangle(context, barX, centerY - barHeight / 2, Math.max(2, barLength), barHeight, 3);
+        context.fill();
+        context.textAlign = "left";
+        context.fillStyle = palette.text;
+        context.font = "600 12px " + palette.mono;
+        context.fillText(TOKEN_NAMES[tokenIndex], 2, centerY);
+        if (hasWideLabels) {
+          context.fillStyle = palette.textDim;
+          context.font = "12px " + palette.font;
+          context.fillText(TOKEN_DESCRIPTIONS[tokenIndex], 44, centerY);
+        }
+        context.fillStyle = palette.text;
+        context.font = "12px " + palette.mono;
+        context.fillText((weight >= 0 ? "+" : "−") + Math.abs(weight).toFixed(2), plotLeft + plotWidth + 6, centerY);
+        weightRows.push({ centerY, rowHeight, weight, tokenIndex });
+      });
+      context.strokeStyle = palette.axis;
+      context.lineWidth = 1;
+      context.beginPath();
+      context.moveTo(Math.round(zeroX) + 0.5, 2);
+      context.lineTo(Math.round(zeroX) + 0.5, height - 2);
+      context.stroke();
+    });
+    BranchBook.attachTooltip("general-weight-canvas", (x, y) => {
+      const row = weightRows.find((candidate) => Math.abs(y - candidate.centerY) <= candidate.rowHeight / 2);
+      if (!row) return null;
+      const direction = row.weight >= 0 ? "taken 쪽" : "not-taken 쪽";
+      return { x, y: row.centerY - 6, html: TOKEN_NAMES[row.tokenIndex] + " (" + TOKEN_DESCRIPTIONS[row.tokenIndex] + ") 하나마다 <b>" + row.weight.toFixed(2) + "</b> · " + direction };
+    });
+    refresh();
+  })();
+
+  /* ============================================================ 퀴즈 */
+  BranchBook.renderQuiz("chapter-quiz", [
+    {
+      question: "분기 A와 B 사이에 방향이 제멋대로인 무관한 분기가 10개 끼어 있다. TAGE 같은 표 기반 예측기가 B를 맞히기 어려운 가장 직접적인 이유는?",
+      options: ["history에 A의 결과가 들어 있지 않기 때문이다", "A의 정보는 있지만 history 전체의 패턴이 수천 가지로 갈려, 패턴마다 entry를 따로 배워야 하기 때문이다", "TAGE는 10개보다 긴 history를 쓰지 못하기 때문이다", "B가 본래 무작위이기 때문이다"],
+      answerIndex: 1,
+      explanation: "정보는 history 안에 있다. 문제는 history를 통째로 hash하는 표현이다. noise bit가 하나 늘 때마다 가능한 패턴이 두 배가 된다.",
+    },
+    {
+      question: "sum-pooling이 noisy history에 강한 이유로 가장 알맞은 것은?",
+      options: ["history를 더 길게 저장하기 때문이다", "구간 안의 정확한 자리를 버리고 특징이 나온 횟수만 남기므로, 상관 있는 분기의 자리가 흔들려도 출력이 같기 때문이다", "무관한 분기를 history에서 지우기 때문이다", "실행 중에 weight를 계속 고치기 때문이다"],
+      answerIndex: 1,
+      explanation: "convolution이 표시한 자리를 구간별로 더하면 횟수가 된다. 자리를 잃는 대신 history가 밀리거나 noise가 끼어도 같은 값이 나온다. 무관한 분기를 무시하는 것은 filter가 그 분기에 반응하지 않기 때문이다.",
+    },
+    {
+      question: "Big-BranchNet과 Mini-BranchNet의 관계를 바르게 설명한 것은?",
+      options: ["Big은 서버용, Mini는 휴대폰용 제품이다", "Big은 CNN으로 얻을 수 있는 상한을 재는 소프트웨어 모델이고, Mini는 칩에 넣을 추론 엔진과 함께 설계한 작은 모델이다", "Big은 offline으로, Mini는 실행 중에 학습한다", "둘은 저장 공간만 다르고 정확도는 같다"],
+      answerIndex: 1,
+      explanation: "논문은 Big-BranchNet을 실제 예측기로 제안하지 않는다. 두 모델 모두 offline으로 학습하며, 원문 Table IV가 보여 주듯 줄이는 과정에서 정확도 이득의 일부를 잃는다.",
+    },
+    {
+      question: "실험 3에서 A가 항상 not-taken인 입력으로 학습한 모델이, A가 가끔 taken인 입력에서 틀리는 이유는?",
+      options: ["학습 횟수가 부족해서다", "학습 입력에서는 A의 not-taken 횟수와 첫 루프의 반복 횟수가 늘 같아서, 둘을 구별하는 관계를 배울 근거가 없었기 때문이다", "시험 입력의 history가 더 길어서다", "모델이 너무 커서다"],
+      answerIndex: 1,
+      explanation: "학습 입력이 분기의 여러 행동을 드러내지 않으면 그 입력에서만 성립하는 관계를 배운다. 논문은 필요한 조건을 대표성이 아니라 coverage라고 부른다.",
+    },
+    {
+      question: "BranchNet 논문에서 gcc의 MPKI가 거의 줄지 않은 이유는?",
+      options: ["gcc의 분기가 모두 데이터에 의존하기 때문이다", "gcc에는 조건부 분기가 거의 없기 때문이다", "오예측이 아주 많은 분기에 고르게 퍼져 있어, 소수의 분기에 모델을 붙이는 방식으로는 줄일 것이 적기 때문이다", "gcc는 학습 입력이 없었기 때문이다"],
+      answerIndex: 2,
+      explanation: "BranchNet은 분기마다 모델 하나를 둔다. 오예측이 몇 개의 분기에 몰려 있을 때 효과가 크고, 얇게 퍼져 있으면 모델을 담을 저장 공간이 먼저 모자란다.",
+    },
+  ]);
+})();
+</script>
+</body>
+</html>

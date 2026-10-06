@@ -1,0 +1,883 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>8장 · 남은 오예측의 비용: APF, SBRB — BranchBook</title>
+<meta name="description" content="어떤 분기는 끝내 틀린다. 반대 경로를 미리 준비해 refill 지연을 줄이는 Alternate Path Fetch와, 취소된 분기의 결과를 다시 쓰는 SBRB를 실험으로 배운다.">
+<link rel="icon" href="../favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/common.js"></script>
+<style>
+  /* 실험 3의 instance 표: 칸을 줄여 좁은 화면에서도 한눈에 보이게 한다 */
+  .reuse-table-wrap { margin: 8px 0 0; }
+  .reuse-table { font-size: 13px; }
+  .reuse-table th, .reuse-table td { padding: 6px 6px; text-align: center; vertical-align: middle; }
+  .reuse-table td.source-cell { text-align: left; font-size: 12.5px; color: var(--text-dim); min-width: 96px; }
+  .reuse-table td.identifier-cell { font-family: var(--mono); white-space: nowrap; }
+  .reuse-table tr.pending-row td { color: var(--text-faint); }
+  .reuse-table tr.current-row td { background: var(--accent-soft); }
+  .reuse-table .outcome-cell { width: 24px; height: 24px; }
+  .reuse-status { display: grid; gap: 6px; margin: 2px 4px 4px; font-size: 13.5px; line-height: 1.6; color: var(--text-dim); }
+  .reuse-status b { color: var(--text); }
+  .reuse-status code { font-size: 12px; }
+  .step-narration { margin: 10px 4px 2px; font-size: 14px; line-height: 1.65; color: var(--text); min-height: 3.3em; }
+  .canvas-caption { margin: 8px 4px 2px; font-size: 12.5px; color: var(--text-dim); }
+  @media (max-width: 560px) {
+    .reuse-table { font-size: 12px; }
+    .reuse-table th, .reuse-table td { padding: 5px 3px; }
+    .reuse-table .outcome-cell { width: 22px; height: 22px; }
+  }
+</style>
+</head>
+<body data-root="../" data-chapter="recovery">
+<main class="chapter">
+  <header class="chapter-hero">
+    <p class="chapter-kicker"></p>
+    <h1>남은 오예측의 비용: APF, SBRB</h1>
+    <p class="lead">4장부터 7장까지의 기법을 모두 써도 어떤 분기는 끝내 틀린다. 이 장의 두 논문은 방향을 더 잘 맞히려 하지 않는다. 틀릴 것을 받아들이고, 틀린 뒤에 치르는 값을 줄인다. 하나는 반대 경로를 미리 준비해 두고, 다른 하나는 취소된 명령 속에서 쓸 만한 분기 결과를 건진다.</p>
+    <div class="objectives">
+      <p class="objectives-title">이 장에서 배우는 것</p>
+      <ul>
+        <li>오예측의 비용을 "버려지는 일"과 "다시 채우는 시간"으로 나누고, 두 기법이 각각 어느 쪽을 줄이는지 구분한다.</li>
+        <li>APF가 반대 경로를 rename 직전까지만 준비하는 이유를 설명할 수 있다.</li>
+        <li>어느 분기의 반대 경로를 준비할지 고르는 일이 적중과 낭비 사이의 절충임을 실험으로 확인한다.</li>
+        <li>취소된 분기 결과를 다시 쓰려면 같은 주소가 아니라 같은 실행 instance를 찾아야 함을 이해한다.</li>
+      </ul>
+    </div>
+  </header>
+
+  <!-- ============================================================ 1 -->
+  <section id="residual">
+    <h2>틀린 뒤에 치르는 두 가지 값</h2>
+    <p><a href="basics.html#penalty">1장</a>에서 오예측 한 번이 어떻게 진행되는지 보았다. 분기가 execute에서 확인되어(<span class="term">resolve</span>) 예측이 틀렸음이 드러나면, 그 뒤에 가져온 명령을 모두 취소하고(<span class="term">squash</span>) 올바른 주소에서 다시 가져온다. 새 명령이 frontend를 지나 backend에 닿을 때까지 뒤쪽 단계는 빈다(<span class="term">refill</span>).</p>
+    <p>이 과정에서 잃는 것을 둘로 나눌 수 있다.</p>
+    <ul>
+      <li><strong>다시 채우는 시간.</strong> 올바른 경로의 명령을 예측하고, 가져오고, 해석하고, rename하는 동안 backend는 할 일이 없다. frontend가 깊을수록 길다.</li>
+      <li><strong>버려지는 일.</strong> 취소된 명령은 한두 개가 아니다. 그 가운데에는 오예측한 분기와 아무 상관 없이 이미 실행을 마친 것도 있다. 그 결과까지 함께 버린다.</li>
+    </ul>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 280" role="img" aria-label="오예측 한 번의 시간 순서와 APF, SBRB가 각각 손대는 구간">
+        <defs>
+          <marker id="recovery-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrow-head"/></marker>
+          <marker id="recovery-arrow-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrow-head-accent"/></marker>
+        </defs>
+        <text x="20" y="24" class="label-strong">오예측 한 번의 시간 순서</text>
+        <rect x="20" y="62" width="120" height="52" rx="9" class="fill-accent-soft"/><text x="80" y="93" text-anchor="middle" class="label-strong">분기 예측</text>
+        <rect x="146" y="62" width="274" height="52" rx="9" class="fill-mispredict-soft"/><text x="283" y="84" text-anchor="middle" class="label-strong">잘못된 경로를 fetch, 실행</text><text x="283" y="103" text-anchor="middle" class="label-dim">✕ 뒤에 모두 취소된다</text>
+        <path d="M426 46 V150" class="stroke-accent"/><text x="426" y="38" text-anchor="middle" class="label-accent">분기 확인: 틀렸다</text>
+        <rect x="432" y="62" width="188" height="52" rx="9" class="fill-surface" stroke-dasharray="5 4"/><text x="526" y="84" text-anchor="middle" class="label-strong">refill</text><text x="526" y="103" text-anchor="middle" class="label-dim">backend는 기다린다</text>
+        <rect x="626" y="62" width="214" height="52" rx="9" class="fill-elevated"/><text x="733" y="93" text-anchor="middle" class="label-strong">올바른 경로 실행</text>
+        <path d="M20 150 H836" class="stroke-line" marker-end="url(#recovery-arrow)"/><text x="840" y="168" text-anchor="end" class="label-dim">시간</text>
+        <path d="M146 166 V176 H420 V166" class="stroke-line"/>
+        <text x="283" y="196" text-anchor="middle" class="label-dim">일부 분기는 이미 실행을 마쳤다</text>
+        <path d="M432 166 V176 H620 V166" class="stroke-accent"/>
+        <text x="526" y="196" text-anchor="middle" class="label-accent">APF: 이 구간을 줄인다</text>
+        <path d="M626 166 V176 H840 V166" class="stroke-accent"/>
+        <text x="733" y="196" text-anchor="middle" class="label-accent">SBRB: 다시 만난 분기에 쓴다</text>
+        <path d="M283 206 C 283 252, 733 252, 733 208" class="stroke-accent" stroke-dasharray="6 4" marker-end="url(#recovery-arrow-accent)"/>
+        <text x="508" y="264" text-anchor="middle" class="label-dim">취소 전에 나온 분기 결과를 올바른 경로의 예측으로 가져간다</text>
+      </svg>
+      <figcaption><b>그림 8-1.</b> 오예측 뒤의 손실과 두 기법이 손대는 곳. 칸의 너비는 시간에 비례하지 않는다.</figcaption>
+    </figure>
+    <p><span class="term">Alternate Path Fetch</span>(APF)는 첫 번째 값을 줄인다. 틀릴 것 같은 분기의 반대 경로를 미리 가져와 두었다가, 틀리면 바로 꺼내 쓴다. <span class="term">SBRB</span><span class="english">(Squashed-Branch Reuse Buffer)</span>는 두 번째 값의 일부를 되찾는다. 취소된 분기의 실행 결과를 남겨 두었다가, 올바른 경로에서 같은 분기를 다시 만나면 예측 대신 쓴다.</p>
+    <p>두 기법 모두 처음의 오예측 자체는 막지 못한다. 그래서 정확도를 올리는 앞 장의 기법과 경쟁하지 않고, 그 위에 얹을 수 있다.</p>
+  </section>
+
+  <!-- ============================================================ 2 -->
+  <section id="apf">
+    <h2>Alternate Path Fetch: 반대 경로를 미리 준비한다</h2>
+    <div class="paper-card">
+      <span class="paper-title">Alternate Path Fetch</span>
+      <span class="paper-meta">Aniket Deshmukh, Lingzhe (Chester) Cai, Yale N. Patt · ISCA 2024 · <a href="https://hps.ece.utexas.edu/pub/Deshmukh_APF.pdf" rel="noopener">원문</a></span>
+      <span class="paper-scope">평가 조건: 64KB TAGE-SC-L baseline, 8-wide OoO 코어(ROB 512, frontend 15 cycle), SPEC CPU2017 정수 + GAP, Scarab 시뮬레이터 · <b>근거 범위: 논문 전문</b></span>
+    </div>
+    <h3>문제: frontend를 넓혀도 얻는 것이 적다</h3>
+    <p>코어를 빠르게 하는 익숙한 방법은 frontend를 넓혀 한 cycle에 더 많은 명령을 공급하는 것이다. 논문은 이 방법의 한계를 수치로 보인다. 8-wide 코어를 16-wide로 넓히면 SPEC CPU2017 정수와 GAP에서 성능이 2.8% 오르는 데 그치고, 면적은 약 20% 늘어난다.</p>
+    <p>이유는 둘이다. 분기예측기는 보통 한 cycle에 taken 분기를 하나만 예측할 수 있고, rename은 폭을 넓히면 단계가 늘어난다. 그리고 오예측이 잦으면 넓어진 폭으로 가져온 명령의 상당수가 어차피 버려진다. 저자들의 제안은 이렇다. 남는 fetch 폭을 예측한 경로를 더 빨리 가져오는 데 쓰지 말고, <em>H2P 분기의 반대 경로</em>를 가져오는 데 쓰자.</p>
+    <p>APF가 겨냥하는 것은 오예측의 횟수가 아니라 <span class="term">pipeline refill 지연</span>이다. 논문의 정의로는, 오예측이 확인된 뒤 올바른 경로의 명령이 backend에 들어가기까지 걸리는 시간이다.</p>
+    <h3>아이디어: 두 번째 frontend와 buffer</h3>
+    <p>APF는 main pipeline 옆에 <strong>반대 경로 전용 frontend</strong>(APF pipeline)를 둔다. 분기예측기가 고른 쪽이 예측 경로, 그 반대쪽이 <span class="term">alternate path</span>다. APF pipeline은 H2P로 표시된 분기의 alternate path를 따라가며 예측, fetch, decode를 하고, rename의 앞부분(같은 묶음 안의 의존성 검사)까지 마친다. 논문의 구성은 Predict 3, Fetch 4, Decode 4, Pre-Rename 2로 13단계이고 폭은 8 micro-op이다.</p>
+    <p>이렇게 처리한 micro-op은 <span class="term">Alternate Path Buffer</span>에 넣어 둔다. buffer는 4개이고 각각 micro-op 104개(8개씩 13 cycle분)를 담는다. buffer가 여럿이라 아직 확인되지 않은 H2P 분기 여러 개의 반대 경로를 동시에 들고 있을 수 있다.</p>
+    <ul>
+      <li>분기가 <strong>맞게</strong> 예측되었으면 그 분기의 buffer를 비운다. 준비한 일은 쓰이지 않는다.</li>
+      <li>분기가 <strong>틀렸으면</strong> buffer의 micro-op을 main pipeline에 넣고, fetch는 반대 경로를 따라간 마지막 지점에서 이어 간다. 논문의 표현으로, main pipeline에서 13 cycle 동안 처리한 것과 같은 상태가 한 cycle 만에 만들어진다.</li>
+    </ul>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 330" role="img" aria-label="APF 구조. 위쪽 APF pipeline이 반대 경로를 처리해 Alternate Path Buffer에 넣고, 오예측이면 아래쪽 main pipeline의 rename 앞에 넣는다">
+        <defs>
+          <marker id="recovery-structure-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrow-head"/></marker>
+          <marker id="recovery-structure-arrow-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrow-head-accent"/></marker>
+        </defs>
+        <text x="20" y="26" class="label-strong">APF pipeline: 반대 경로를 RAT 접근 직전까지 처리한다 (13단계)</text>
+        <rect x="20" y="42" width="120" height="52" rx="9" class="fill-accent-soft"/><text x="80" y="64" text-anchor="middle" class="label-strong">Predict</text><text x="80" y="83" text-anchor="middle" class="label-dim">3단계</text>
+        <rect x="160" y="42" width="120" height="52" rx="9" class="fill-accent-soft"/><text x="220" y="64" text-anchor="middle" class="label-strong">Fetch</text><text x="220" y="83" text-anchor="middle" class="label-dim">4단계</text>
+        <rect x="300" y="42" width="120" height="52" rx="9" class="fill-accent-soft"/><text x="360" y="64" text-anchor="middle" class="label-strong">Decode</text><text x="360" y="83" text-anchor="middle" class="label-dim">4단계</text>
+        <rect x="440" y="42" width="140" height="52" rx="9" class="fill-accent-soft"/><text x="510" y="64" text-anchor="middle" class="label-strong">Pre-Rename</text><text x="510" y="83" text-anchor="middle" class="label-dim">의존성 검사 2단계</text>
+        <rect x="610" y="42" width="230" height="52" rx="9" class="fill-surface"/><text x="725" y="64" text-anchor="middle" class="label-strong">Alternate Path Buffer × 4</text><text x="725" y="83" text-anchor="middle" class="label-dim">buffer마다 micro-op 104개</text>
+        <path d="M142 68 H156" class="stroke-line" marker-end="url(#recovery-structure-arrow)"/>
+        <path d="M282 68 H296" class="stroke-line" marker-end="url(#recovery-structure-arrow)"/>
+        <path d="M422 68 H436" class="stroke-line" marker-end="url(#recovery-structure-arrow)"/>
+        <path d="M582 68 H606" class="stroke-line" marker-end="url(#recovery-structure-arrow)"/>
+        <rect x="20" y="122" width="390" height="50" rx="9" class="fill-elevated"/><text x="215" y="143" text-anchor="middle" class="label-strong">분기예측기, BTB, I-cache</text><text x="215" y="162" text-anchor="middle" class="label-dim">bank로 나눠 두 경로가 같은 cycle에 읽는다</text>
+        <path d="M80 96 V120" class="stroke-dashed"/><path d="M220 96 V120" class="stroke-dashed"/>
+        <path d="M80 174 V214" class="stroke-dashed"/><path d="M220 174 V214" class="stroke-dashed"/>
+        <rect x="430" y="114" width="170" height="66" rx="9" class="fill-elevated"/><text x="515" y="134" text-anchor="middle" class="label-dim">대상 분기 선택</text><text x="515" y="153" text-anchor="middle" class="label">H2P Table (128)</text><text x="515" y="171" text-anchor="middle" class="label">+ TAGE confidence</text>
+        <path d="M640 96 V212" class="stroke-accent" marker-end="url(#recovery-structure-arrow-accent)"/>
+        <text x="652" y="140" class="label-accent">오예측이 확인되면</text><text x="652" y="158" class="label-accent">준비된 micro-op을 넣는다</text>
+        <text x="20" y="206" class="label-strong">Main pipeline: 예측한 경로 (frontend 15단계)</text>
+        <rect x="20" y="216" width="120" height="52" rx="9" class="fill-surface"/><text x="80" y="247" text-anchor="middle" class="label">Predict</text>
+        <rect x="160" y="216" width="120" height="52" rx="9" class="fill-surface"/><text x="220" y="247" text-anchor="middle" class="label">Fetch</text>
+        <rect x="300" y="216" width="120" height="52" rx="9" class="fill-surface"/><text x="360" y="247" text-anchor="middle" class="label">Decode</text>
+        <rect x="440" y="216" width="140" height="52" rx="9" class="fill-surface"/><text x="510" y="247" text-anchor="middle" class="label">의존성 검사</text>
+        <rect x="610" y="216" width="60" height="52" rx="9" class="fill-accent-soft"/><text x="640" y="247" text-anchor="middle" class="label-strong">MUX</text>
+        <rect x="690" y="216" width="80" height="52" rx="9" class="fill-surface"/><text x="730" y="247" text-anchor="middle" class="label">RAT 접근</text>
+        <rect x="790" y="216" width="56" height="52" rx="9" class="fill-surface"/><text x="818" y="247" text-anchor="middle" class="label-dim">backend</text>
+        <path d="M142 242 H156" class="stroke-line" marker-end="url(#recovery-structure-arrow)"/>
+        <path d="M282 242 H296" class="stroke-line" marker-end="url(#recovery-structure-arrow)"/>
+        <path d="M422 242 H436" class="stroke-line" marker-end="url(#recovery-structure-arrow)"/>
+        <path d="M582 242 H606" class="stroke-line" marker-end="url(#recovery-structure-arrow)"/>
+        <path d="M672 242 H686" class="stroke-line" marker-end="url(#recovery-structure-arrow)"/>
+        <path d="M772 242 H786" class="stroke-line" marker-end="url(#recovery-structure-arrow)"/>
+        <text x="20" y="304" class="label-dim">반대 경로의 명령은 RAT에 접근하지 않고 실행도 하지 않는다. 그래서 register 상태를 따로 저장하거나 backend 자원을 더 쓸 일이 없다.</text>
+      </svg>
+      <figcaption><b>그림 8-2.</b> Alternate Path Fetch의 구조. 원문 Fig. 5를 다시 그림. 단계 수는 논문이 평가에 쓴 구성이다.</figcaption>
+    </figure>
+    <p>왜 rename 직전에서 멈추는가. 반대 경로의 명령이 <span class="term">RAT</span><span class="english">(Register Alias Table)</span>에 접근하면 RAT와 free list의 상태가 바뀐다. 그러면 반대 경로마다 그 상태를 따로 저장해야 하고, H2P 분기를 만날 때마다 저장할 상태가 불어난다. 논문은 여기서 더 나아가는 방식을 Dual Path Instruction Processing(DPIP)과 비교한다. 분기 하나당 아끼는 시간은 늘지만, 준비할 수 있는 분기 수가 크게 줄어 전체 성능은 오히려 낮았다고 보고한다.</p>
+    <p>두 경로를 같은 cycle에 예측하고 가져오려면 분기예측기와 I-cache를 두 곳에서 동시에 읽어야 한다. 논문은 읽기 port를 늘리는 대신 구조를 <span class="term">bank</span>로 나눈다. 64KB TAGE-SC-L을 16KB짜리 넷으로 쪼개고, 두 경로가 서로 다른 bank를 읽는 cycle에만 동시에 예측한다. 같은 bank에서 만나면 예측 경로가 먼저다. 이 분할의 대가로 평균 MPKI가 0.1 늘고 baseline 성능이 0.5% 줄어든다고 논문은 밝힌다.</p>
+
+    <div class="simulator" id="simulator-refill">
+      <div class="simulator-head"><span class="simulator-tag">실험 1</span><h3>refill을 건너뛰기</h3></div>
+      <div class="simulator-body side">
+        <div class="simulator-view">
+          <div class="legend"><span><i style="background:var(--series-1)"></i>확인 뒤에 새로 가져온 묶음</span><span><i style="background:var(--series-3)"></i>buffer에서 꺼낸 묶음</span><span><i style="background:transparent; box-shadow: 0 0 0 1px var(--text-faint)"></i>빈 cycle</span></div>
+          <canvas id="refill-canvas" data-height="350" aria-label="오예측이 확인된 뒤 cycle별로 명령 묶음이 frontend를 지나 rename에 들어가는 모습"></canvas>
+        </div>
+        <div class="simulator-controls">
+          <label class="control"><span>frontend 깊이 <output id="refill-depth-output"></output></span><input type="range" id="refill-depth" min="6" max="20" step="1" value="15"></label>
+          <label class="check"><input type="checkbox" id="refill-prepared" checked> 반대 경로를 미리 준비했다</label>
+          <label class="control"><span>buffer에 든 micro-op <output id="refill-buffer-output"></output></span><input type="range" id="refill-buffer" min="0" max="104" step="8" value="104"></label>
+        </div>
+      </div>
+      <div class="simulator-readout">
+        <div class="statistic"><span class="statistic-label">준비 없을 때 첫 rename 진입</span><span class="statistic-value" id="refill-baseline">—</span></div>
+        <div class="statistic"><span class="statistic-label">지금 설정에서 첫 rename 진입</span><span class="statistic-value" id="refill-current">—</span></div>
+        <div class="statistic"><span class="statistic-label">앞당긴 공급</span><span class="statistic-value" id="refill-saved">—</span></div>
+        <div class="statistic"><span class="statistic-label">남은 빈 cycle</span><span class="statistic-value" id="refill-bubble">—</span></div>
+      </div>
+      <div class="simulator-note"><b>그림 읽는 법.</b> 가로는 cycle이고, 옅게 칠한 맨 왼쪽 칸(cycle 0)이 오예측을 확인한 cycle이다. 위쪽은 올바른 경로의 명령 묶음(cycle당 micro-op 8개)마다 한 줄이다. 옅은 부분은 rename 이전 단계를 지나거나 buffer에서 기다리는 시간, 진한 부분은 rename이다. 아래 두 줄은 cycle마다 rename에 들어가는 묶음이 있는지를 보인다. <b>설명용 모델.</b> frontend의 마지막 두 단계가 RAT 접근이고 반대 경로는 그 앞까지만 준비된다고 가정했다. buffer의 묶음은 확인 다음 cycle부터 하나씩 들어가고, fetch는 buffer가 끝나는 지점에서 곧바로 이어진다고 보았다. <b>해 볼 것.</b> micro-op 수를 줄여 보자. 첫 묶음은 여전히 일찍 도착하지만 buffer가 바닥난 뒤 빈 cycle이 다시 생긴다. 깊이를 15, micro-op을 104로 두면 논문의 구성(13 cycle분)과 같다.</div>
+    </div>
+    <p>실험이 보여 주는 것은 두 가지다. 준비된 경로가 있으면 첫 명령이 확인 직후에 rename에 들어간다. 그러나 전체 공급이 앞당겨지는 양은 <strong>buffer에 들어 있는 만큼</strong>이다. 분기가 너무 빨리 확인되어 반대 경로를 조금밖에 못 가져왔다면 아끼는 시간도 그만큼 줄어든다.</p>
+
+    <h3>어느 분기의 반대 경로를 준비할까</h3>
+    <p>APF pipeline은 하나뿐이고 buffer는 넷이다. 모든 분기의 반대 경로를 준비할 수는 없다. 그런데 준비한 경로는 그 분기가 <strong>틀렸을 때만</strong> 쓰인다. 맞힌 분기에 쓴 준비는 전부 낭비다.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>상황</th><th>준비한 반대 경로</th><th>결과</th></tr></thead>
+      <tbody>
+        <tr><td>예측이 맞았다</td><td>쓰이지 않고 버려진다</td><td>fetch와 decode에 든 일이 낭비된다. 그동안 다른 분기는 준비하지 못했다.</td></tr>
+        <tr><td>틀렸고, 준비가 끝나 있었다</td><td>main pipeline에 바로 들어간다</td><td>refill 지연이 준비한 만큼 줄어든다.</td></tr>
+        <tr><td>틀렸는데, 준비가 없거나 짧았다</td><td>없거나 일부만 있다</td><td>평소처럼 처음부터 가져오거나, 조금만 아낀다.</td></tr>
+      </tbody>
+    </table></div>
+    <p>논문은 대상을 두 신호로 고른다.</p>
+    <ul>
+      <li><span class="term">H2P Table</span>: 분기 주소별로 오예측을 세는 128-entry 표다. 틀릴 때마다 3-bit 카운터를 올리고, 명령 2만 개마다 모든 카운터를 하나씩 내린다. 카운터가 2를 넘으면 H2P로 본다. 오래 지켜본 결과라서 놓치는 오예측이 적지만, 표시한 분기의 대부분은 그 순간에는 맞게 예측된다.</li>
+      <li><span class="term">TAGE confidence</span>: 지금 이 예측을 낸 카운터가 포화되지 않았으면 낮은 confidence로 본다. 주소뿐 아니라 history까지 반영하므로 낭비가 적지만, 놓치는 오예측이 많다.</li>
+    </ul>
+    <div class="callout evidence">
+      <strong>논문이 보고한 두 신호의 성격 (원문 Table II)</strong>
+      <p>H2P Table은 오예측의 95.43%를 표시하지만, 표시한 분기의 89.61%는 실제로는 틀리지 않았다. TAGE confidence는 각각 56.33%와 74.52%다. APF는 둘을 함께 쓴다. 아직 확인되지 않은 분기 가운데 낮은 confidence로 표시된 가장 오래된 분기를 먼저 고르고, 없으면 H2P Table이 표시한 가장 오래된 분기를 고른다. H2P Table만 쓰면 speedup이 3.3%, 둘을 함께 쓰면 5%였다.</p>
+    </div>
+    <p>오래된 분기부터 고르는 데에도 이유가 있다. 정확도가 80%인 H2P 분기의 반대 경로가 옳을 확률은 20%다. 그 뒤에 오는 H2P 분기의 반대 경로가 쓰이려면 앞의 분기는 맞고 이 분기는 틀려야 하므로 확률이 80% × 20% = 16%로 줄어든다.</p>
+    <p>아래 실험에서 "얼마나 자주 틀리는 분기부터 준비 대상으로 삼을지"를 직접 정해 보자.</p>
+
+    <div class="simulator" id="simulator-select">
+      <div class="simulator-head"><span class="simulator-tag">실험 2</span><h3>어느 분기의 반대 경로를 준비할까</h3></div>
+      <div class="simulator-body side">
+        <div class="simulator-view">
+          <div class="canvas-caption">분기 36개의 오예측 확률. 색이 칠해진 막대가 준비 대상으로 표시된 분기다.</div>
+          <canvas id="select-population-canvas" data-height="150" aria-label="분기 36개의 오예측 확률 막대와 표시 기준선"></canvas>
+          <div class="legend" style="padding-top: 12px"><span><i class="line" style="background:var(--series-1)"></i>적중: 준비된 경로가 있었던 오예측</span><span><i class="line" style="background:var(--series-2)"></i>낭비: 쓰이지 않은 준비</span><span><i class="line" style="background:var(--series-3)"></i>순이득</span></div>
+          <canvas id="select-chart-canvas" data-height="270" aria-label="표시 기준에 따른 적중, 낭비, 순이득 곡선"></canvas>
+        </div>
+        <div class="simulator-controls">
+          <label class="control"><span>표시 기준: 오예측 확률 <output id="select-threshold-output"></output></span><input type="range" id="select-threshold" min="0" max="45" step="1" value="3"></label>
+          <label class="control"><span>Alternate Path Buffer 수 <output id="select-buffers-output"></output></span><input type="range" id="select-buffers" min="1" max="8" step="1" value="4"></label>
+          <label class="control"><span>쓰이지 않은 준비 하나의 비용 <output id="select-waste-output"></output></span><input type="range" id="select-waste" min="0" max="3" step="0.25" value="0.5"></label>
+        </div>
+      </div>
+      <div class="simulator-readout">
+        <div class="statistic"><span class="statistic-label">표시된 분기</span><span class="statistic-value" id="select-marked">—</span></div>
+        <div class="statistic"><span class="statistic-label">적중 (준비가 있었던 오예측)</span><span class="statistic-value" id="select-coverage">—</span></div>
+        <div class="statistic"><span class="statistic-label">낭비 (쓰이지 않은 준비)</span><span class="statistic-value" id="select-wastage">—</span></div>
+        <div class="statistic"><span class="statistic-label">순이득 (이상적 최대 대비)</span><span class="statistic-value" id="select-benefit">—</span></div>
+      </div>
+      <div class="simulator-note"><b>설명용 모델.</b> 분기 36개의 오예측 확률과 실행 빈도는 미리 정해 둔 값이다. 표시기가 각 분기의 오예측 확률을 정확히 안다고 가정했다. 확인을 기다리는 분기는 한 번에 평균 16개이고, 그중 표시된 분기가 buffer 수보다 많으면 buffer 수만큼만 준비된다. 준비된 경로가 쓰이면 13 cycle을 아끼고, 쓰이지 않으면 슬라이더로 정한 cycle만큼 손해라고 보았다. 순이득은 모든 오예측에 준비된 경로가 있고 낭비가 없을 때를 100%로 둔 값이다. <b>해 볼 것.</b> 기준을 0%로 내리면 모든 분기를 표시한다. 적중이 오히려 떨어지는 이유는 buffer를 잘 틀리지 않는 분기와 나눠 쓰기 때문이다. 기준을 40%로 올리면 낭비는 줄지만 대부분의 오예측을 놓친다. 순이득이 가장 높은 기준은 그 사이에 있고, buffer 수를 바꾸면 그 위치가 옮겨 간다.</div>
+    </div>
+    <p>논문도 같은 절충을 말한다. 너무 많은 분기를 H2P로 표시하면, APF가 쓸 수 있는 cycle이 더 많은 분기에 나뉘어 분기 하나당 이득이 줄고 적중은 그만큼 늘지 않는다. buffer 수를 늘리는 효과도 금방 줄어든다. H2P 분기는 대개 빨리 확인되어 동시에 떠 있는 수가 많지 않기 때문에, buffer 하나만 있어도 이득의 큰 부분을 얻는다고 보고한다.</p>
+
+    <h3>논문이 보고한 결과</h3>
+    <div class="callout evidence">
+      <strong>성능 (원문 Fig. 8과 본문)</strong>
+      <p>8-wide OoO 코어(ROB 512, frontend 15 cycle, 64KB TAGE-SC-L, bank로 나누지 않은 예측기 기준) 대비 SPEC CPU2017 정수와 GAP에서 기하평균 약 5% speedup. 같은 조건에서 16-wide 코어를 만드는 것은 2.8%다. 비교 기법인 DPIP는 fetch cycle을 번갈아 쓰는 원래 방식에서 1.6%, APF의 병렬 fetch를 빌려 쓴 구성에서 3.2%였다. frontend가 깊을수록 이득이 크고, frontend를 12단계로 줄인 구성에서도 4.4%를 보고한다.</p>
+    </div>
+    <p>benchmark별 차이도 있다. 논문에 따르면 오예측이 많은 benchmark가 대체로 크게 좋아지지만, tc와 bc는 예측기 bank 충돌이 잦아 이득이 작다. omnetpp와 pr은 오예측이 많아도 그 오예측이 프로그램의 임계 경로에 있지 않은 경우가 있어 효과가 덜하다.</p>
+    <h3>비용과 한계</h3>
+    <ul>
+      <li><strong>오예측은 줄지 않는다.</strong> APF는 예측한 경로만 실행한다. 틀린 뒤 backend를 비우고 RAT를 되돌리는 일은 그대로 남는다. 줄어드는 것은 frontend를 다시 채우는 시간뿐이다.</li>
+      <li><strong>쓰이지 않는 준비.</strong> 위 Table II의 수치대로, 준비한 반대 경로의 다수는 쓰이지 않는다. 논문은 APF pipeline이 평균적으로 실행 시간의 65% 동안 켜져 있다고 밝힌다.</li>
+      <li><strong>면적과 전력.</strong> McPAT 추정으로 APF pipeline 단계가 코어 면적의 약 2%(그중 decode가 약 1.6%), 추가 전력은 코어 전력의 최대 10%다. buffer는 3.2KB다.</li>
+      <li><strong>준비가 안 되는 경우.</strong> H2P로 표시된 분기의 오예측 가운데 10–30%는 APF pipeline이 다른 분기를 처리하느라 바빠 한 cycle도 아끼지 못했다. 반대 경로에서 I-cache miss가 나거나 return이 아닌 간접 분기를 만나면 준비를 멈춘다.</li>
+      <li><strong>bank 충돌.</strong> 두 경로가 같은 예측기 bank를 읽으려는 cycle의 비율은 대부분 25% 아래지만, tc에서는 44.42%, bfs에서는 22.69%였다.</li>
+      <li><strong>평가 범위.</strong> SPEC CPU2017 정수와 GAP에서 평가했다. 코드가 큰 서버 응용에서의 결과는 논문에 없다.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ 3 -->
+  <section id="sbrb">
+    <h2>SBRB: 취소된 분기 결과를 다시 쓴다</h2>
+    <div class="paper-card">
+      <span class="paper-title">Augmenting the Branch Predictor with a Squashed-Branch Reuse Buffer</span>
+      <span class="paper-meta">Rohit Singh, Jiayang Li, Eric Rotenberg · ISCA 2026 · <a href="https://repository.lib.ncsu.edu/server/api/core/bitstreams/c564dc41-e6d4-4bce-bdb6-b639d19cc68a/content" rel="noopener">공개 자료</a> · <a href="https://doi.org/10.1109/ISCA66397.2026.00052" rel="noopener">DOI</a></span>
+      <span class="paper-scope">평가 조건(초록): 64KB TAGE-SC-L에 11KB 추가, SPEC2006·2017 정수 + GAP · <b>근거 범위: 공개 초록</b></span>
+    </div>
+    <div class="callout caution">
+      <strong>이 절의 근거 범위</strong>
+      <p>이 논문은 공개 초록만 확인했다. 아래의 문제 설정, 식별 방법의 큰 틀, 수치는 초록에 있는 내용이다. 실험과 그림의 예제는 초록의 설명을 이해하기 위해 이 책이 만든 것이며, 논문의 회로나 측정이 아니다.</p>
+    </div>
+    <h3>문제: 버리는 것 중에 이미 답이 나온 분기가 있다</h3>
+    <p>오예측 하나는 그 뒤의 젊은 명령을 많이 취소한다. 그중에는 분기도 있고, 일부는 취소되기 전에 이미 실행을 마쳐 방향이 나와 있다. 초록은 여기에 주목한다. 그 분기가 오예측한 분기와 <strong>제어 흐름으로도 데이터로도 무관</strong>하다면, 올바른 경로에서 다시 fetch했을 때도 같은 결과가 나온다. 그렇다면 다시 예측할 필요 없이 그 결과를 쓰면 된다.</p>
+    <p>예를 들어 보자. 아래 루프에서 <code>B0</code>는 늦게 확인되는 어려운 분기다. <code>J</code>는 안쪽 루프에서 표의 값을 검사하는 분기이고, <code>B0</code>가 어느 쪽으로 가든 같은 값을 본다.</p>
+<pre><code>for (outer = 0; outer &lt; rowCount; outer++) {
+    if (rowFlag[outer]) adjust();           // B0: 값이 늦게 도착해 늦게 확인된다
+    for (inner = 0; inner &lt; 4; inner++) {
+        if (table[outer][inner] &gt; limit)    // J: B0의 방향과 무관한 데이터로 정해진다
+            count++;
+    }
+}</code></pre>
+    <p><code>B0</code>를 잘못 예측한 채로 프로세서는 안쪽 루프까지 들어가 <code>J</code>를 여러 번 실행한다. 그 뒤 <code>B0</code>가 틀렸음이 드러나면 이 <code>J</code>들은 모두 취소된다. 올바른 경로에서 프로세서는 같은 <code>J</code>들을 다시 만난다. J가 예측하기 어려운 분기라면 여기서 또 틀릴 수 있다. 답을 방금 계산했는데도 말이다.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 300" role="img" aria-label="SBRB 개념도. 취소되는 경로에서 실행된 분기의 결과를 반복 위치와 주소로 만든 key로 보관하고, 올바른 경로에서 같은 key로 찾아 쓴다">
+        <defs>
+          <marker id="recovery-reuse-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrow-head"/></marker>
+          <marker id="recovery-reuse-arrow-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrow-head-accent"/></marker>
+        </defs>
+        <text x="20" y="26" class="label-strong">취소되는 경로 (B0를 잘못 예측한 뒤)</text>
+        <rect x="20" y="40" width="230" height="56" rx="9" class="fill-mispredict-soft"/><text x="135" y="63" text-anchor="middle" class="label-strong">J가 실행을 마친다</text><text x="135" y="83" text-anchor="middle" class="label-dim">✕ 곧 취소되지만 결과는 나왔다</text>
+        <rect x="290" y="40" width="250" height="56" rx="9" class="fill-accent-soft"/><text x="415" y="63" text-anchor="middle" class="label-strong">hash(signature, PC)</text><text x="415" y="83" text-anchor="middle" class="label-dim">loop 반복 위치와 분기 주소</text>
+        <rect x="580" y="40" width="260" height="56" rx="9" class="fill-surface"/><text x="710" y="63" text-anchor="middle" class="label-strong">SBRB에 결과를 둔다</text><text x="710" y="83" text-anchor="middle" class="label-dim">64KB TAGE-SC-L 옆에 11KB</text>
+        <path d="M252 68 H286" class="stroke-line" marker-end="url(#recovery-reuse-arrow)"/>
+        <path d="M542 68 H576" class="stroke-line" marker-end="url(#recovery-reuse-arrow)"/>
+        <text x="20" y="160" class="label-strong">올바른 경로 (B0를 고친 뒤 다시 fetch)</text>
+        <rect x="20" y="174" width="230" height="56" rx="9" class="fill-elevated"/><text x="135" y="197" text-anchor="middle" class="label-strong">같은 J를 다시 fetch한다</text><text x="135" y="217" text-anchor="middle" class="label-dim">예측이 필요한 시점</text>
+        <rect x="290" y="174" width="250" height="56" rx="9" class="fill-accent-soft"/><text x="415" y="197" text-anchor="middle" class="label-strong">hash(signature, PC)</text><text x="415" y="217" text-anchor="middle" class="label-dim">같은 instance면 같은 key</text>
+        <rect x="580" y="174" width="260" height="56" rx="9" class="fill-surface"/><text x="710" y="197" text-anchor="middle" class="label-strong">hit: 저장된 결과로 덮어쓴다</text><text x="710" y="217" text-anchor="middle" class="label-dim">miss: TAGE-SC-L 예측 그대로</text>
+        <path d="M252 202 H286" class="stroke-line" marker-end="url(#recovery-reuse-arrow)"/>
+        <path d="M542 202 H576" class="stroke-line" marker-end="url(#recovery-reuse-arrow)"/>
+        <path d="M710 98 V170" class="stroke-accent" marker-end="url(#recovery-reuse-arrow-accent)"/><text x="722" y="140" class="label-accent">저장된 결과</text>
+        <text x="20" y="272" class="label-dim">언제 넣는지, 언제 무효로 하는지, confidence를 어떻게 다루는지는 초록에 없어 그리지 않았다.</text>
+      </svg>
+      <figcaption><b>그림 8-3.</b> SBRB의 역할. 공개 초록을 바탕으로 재구성한 개념도이며 논문의 그림이 아니다.</figcaption>
+    </figure>
+    <h3>어려운 점: 같은 주소가 아니라 같은 실행을 찾아야 한다</h3>
+    <p>초록이 꼽는 어려움은 <strong>짝짓기</strong>다. 올바른 경로에서 만난 분기가 취소된 경로의 어느 분기와 같은 것인지 알아야 한다. 분기의 주소(PC)만으로는 안 된다. 루프 안의 분기는 반복마다 같은 주소를 쓴다. 바깥 2번째, 안쪽 3번째 반복의 <code>J</code>와 안쪽 4번째 반복의 <code>J</code>는 주소가 같지만 다른 데이터를 보는 다른 실행이다. 이렇게 한 번 한 번의 실행을 <span class="term">dynamic instance</span>라고 부른다.</p>
+    <p>두 경로에서 그 분기에 이르는 길이 다르다는 점도 문제다. 위 예에서 잘못된 경로는 <code>adjust()</code>를 거치지 않았고 올바른 경로는 거친다. 지나온 분기의 방향을 이어 붙인 <a href="history.html">history</a>는 두 경로에서 서로 다르다. history로 찾으면 같은 instance인데도 다른 것으로 보인다.</p>
+    <p>초록에 따르면 SBRB는 instance를 <strong>계층적인 loop 반복 식별자</strong>로 구별한다. "어느 루프의 몇 번째 반복 안에 있는가"를 바깥 루프부터 차례로 적은 것이다. 하드웨어로는 이 식별자를 <span class="term">LFSR</span><span class="english">(Linear Feedback Shift Register)</span> 기반의 signature와 작은 stack으로 구현한다. buffer는 signature와 PC를 hash한 값으로 찾고, 맞는 entry가 있으면 그 결과로 64KB TAGE-SC-L의 예측을 덮어쓴다.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 300" role="img" aria-label="같은 분기 J의 서로 다른 실행 instance를 바깥 반복과 안쪽 반복 번호로 구별하는 그림">
+        <text x="20" y="26" class="label-strong">같은 분기 J, 서로 다른 실행 instance</text>
+        <g class="label-dim" text-anchor="middle"><text x="214" y="58">안쪽 0</text><text x="314" y="58">안쪽 1</text><text x="414" y="58">안쪽 2</text><text x="514" y="58">안쪽 3</text></g>
+        <text x="20" y="95" class="label">바깥 반복 1</text><text x="20" y="145" class="label">바깥 반복 2</text><text x="20" y="195" class="label">바깥 반복 3</text>
+        <g>
+          <rect x="170" y="70" width="88" height="40" rx="8" class="fill-surface"/><text x="214" y="95" text-anchor="middle" class="label-mono">J(1,0)</text>
+          <rect x="270" y="70" width="88" height="40" rx="8" class="fill-surface"/><text x="314" y="95" text-anchor="middle" class="label-mono">J(1,1)</text>
+          <rect x="370" y="70" width="88" height="40" rx="8" class="fill-mispredict-soft"/><text x="414" y="95" text-anchor="middle" class="label-mono">✕ J(1,2)</text>
+          <rect x="470" y="70" width="88" height="40" rx="8" class="fill-surface"/><text x="514" y="95" text-anchor="middle" class="label-mono">J(1,3)</text>
+          <rect x="170" y="120" width="88" height="40" rx="8" class="fill-surface"/><text x="214" y="145" text-anchor="middle" class="label-mono">J(2,0)</text>
+          <rect x="270" y="120" width="88" height="40" rx="8" class="fill-mispredict-soft"/><text x="314" y="145" text-anchor="middle" class="label-mono">✕ J(2,1)</text>
+          <rect x="370" y="120" width="88" height="40" rx="8" class="fill-accent-soft"/><text x="414" y="145" text-anchor="middle" class="label-strong">J(2,2)</text>
+          <rect x="470" y="120" width="88" height="40" rx="8" class="fill-mispredict-soft"/><text x="514" y="145" text-anchor="middle" class="label-mono">✕ J(2,3)</text>
+          <rect x="170" y="170" width="88" height="40" rx="8" class="fill-surface"/><text x="214" y="195" text-anchor="middle" class="label-mono">J(3,0)</text>
+          <rect x="270" y="170" width="88" height="40" rx="8" class="fill-surface"/><text x="314" y="195" text-anchor="middle" class="label-mono">J(3,1)</text>
+          <rect x="370" y="170" width="88" height="40" rx="8" class="fill-mispredict-soft"/><text x="414" y="195" text-anchor="middle" class="label-mono">✕ J(3,2)</text>
+          <rect x="470" y="170" width="88" height="40" rx="8" class="fill-surface"/><text x="514" y="195" text-anchor="middle" class="label-mono">J(3,3)</text>
+        </g>
+        <text x="590" y="84" class="label-strong">PC만 보면</text><text x="590" y="103" class="label-dim">열두 칸이 모두 같은 분기다</text>
+        <text x="590" y="138" class="label-strong">반복 위치를 붙이면</text><text x="590" y="157" class="label-dim">(바깥 2, 안쪽 2) 하나로 정해진다</text>
+        <text x="590" y="192" class="label-strong">SBRB의 signature</text><text x="590" y="211" class="label-dim">이 위치를 LFSR 값과 작은</text><text x="590" y="228" class="label-dim">stack으로 줄여서 들고 다닌다</text>
+        <text x="20" y="254" class="label-dim">보라색 칸: 결과를 저장해 둔 instance. ✕ 칸: 주소가 같아 그 결과를 잘못 가져다 쓰기 쉬운 이웃.</text>
+        <text x="20" y="276" class="label-dim">이웃 instance는 다른 데이터를 검사하므로 결과가 같다는 보장이 없다.</text>
+      </svg>
+      <figcaption><b>그림 8-4.</b> 주소가 같은 분기의 instance를 반복 위치로 구별하기. 공개 초록의 설명을 바탕으로 재구성했고, (바깥, 안쪽) 표기는 설명용이다.</figcaption>
+    </figure>
+    <p>이 식별자의 요점은 <strong>지나온 길이 달라도 같은 instance에는 같은 값이 붙는다</strong>는 것이다. 잘못된 경로에서든 올바른 경로에서든 "바깥 2번째, 안쪽 2번째 반복의 J"는 같은 위치다. 아래 실험에서 세 가지 짝짓기 방식을 비교해 보자.</p>
+
+    <div class="simulator" id="simulator-reuse">
+      <div class="simulator-head"><span class="simulator-tag">실험 3</span><h3>취소된 결과를 다시 쓰기</h3></div>
+      <div class="simulator-body">
+        <div class="simulator-view">
+          <div class="legend"><span><i style="background:var(--taken)"></i>T: taken</span><span><i style="background:var(--not-taken)"></i>N: not-taken</span><span><i style="background:transparent; box-shadow: 0 0 0 2px var(--mispredict)"></i>✕ 틀린 예측</span></div>
+          <div class="reuse-status" id="reuse-status" aria-live="polite"></div>
+          <div class="table-wrap reuse-table-wrap"><table class="reuse-table" aria-label="분기 J의 instance별 취소 전 결과와 다시 fetch할 때의 예측">
+            <thead><tr><th>분기</th><th title="바깥 반복 번호, 안쪽 반복 번호">(바깥, 안쪽)</th><th>취소 전 결과</th><th>다시 쓴 예측</th><th>예측의 출처</th><th>실제</th></tr></thead>
+            <tbody id="reuse-rows"></tbody>
+          </table></div>
+          <div class="step-narration" id="reuse-narration" aria-live="polite"></div>
+        </div>
+        <div class="simulator-controls inline">
+          <div class="control"><span>다시 fetch할 때의 짝짓기 방식</span><div class="segmented" id="reuse-policy"><button data-value="none">다시 쓰지 않음</button><button data-value="address">PC만</button><button data-value="signature" class="on">PC + 반복 signature</button></div></div>
+          <div class="control"><span>진행</span><div class="control-row"><button class="button primary" id="reuse-step">한 단계</button><button class="button" id="reuse-play">자동 실행</button><button class="button" id="reuse-reset">처음부터</button></div></div>
+        </div>
+      </div>
+      <div class="simulator-readout">
+        <div class="statistic"><span class="statistic-label">단계</span><span class="statistic-value" id="reuse-progress">—</span></div>
+        <div class="statistic"><span class="statistic-label">buffer에서 가져온 예측</span><span class="statistic-value" id="reuse-reused">—</span></div>
+        <div class="statistic"><span class="statistic-label">그중 틀린 것</span><span class="statistic-value" id="reuse-wrong">—</span></div>
+        <div class="statistic"><span class="statistic-label">J 오예측</span><span class="statistic-value" id="reuse-mispredictions">—</span></div>
+      </div>
+      <div class="simulator-note"><b>설명용 모델.</b> 바깥 반복 2에서 B0를 not-taken으로 예측했지만 실제는 taken이다. B0가 확인되기 전에 J의 instance 넷이 실행을 마쳤고, 다섯째인 J(3,0)은 fetch만 되었다. 결과 값과 기본 예측기의 예측은 설명을 위해 정해 둔 것이다. "PC만"은 주소마다 마지막으로 실행된 결과 하나를 기억한다고 가정했다. 논문의 buffer 구성과 갱신 규칙은 확인되지 않았으므로, 이 실험은 식별 방법의 차이만 보여 준다. <b>해 볼 것.</b> 세 방식을 바꿔 가며 끝까지 진행해 보자. "PC만"은 J(2,3)의 결과를 다른 반복에 가져다 써서, 기본 예측기가 맞혔을 분기까지 틀린다. signature 방식도 J(3,0)은 돕지 못한다. 취소 전에 실행을 마치지 못했기 때문이다.</div>
+    </div>
+    <p>실험에서 얻을 점은 둘이다. 잘못 짝지은 재사용은 없느니만 못할 수 있다. 덮어쓰는 값이 틀리면 원래 맞았을 예측까지 망친다. 그리고 올바르게 짝지어도 재사용할 수 있는 것은 <strong>취소되기 전에 실행을 마친 instance</strong>뿐이다.</p>
+    <h3>초록이 보고한 결과</h3>
+    <div class="callout evidence">
+      <strong>성능 (공개 초록)</strong>
+      <p>64KB TAGE-SC-L에 총 11KB의 상태를 더한 구성에서, SPEC2006·2017 정수는 평균 +2.08%, GAP은 평균 +7.25%, 둘을 합친 전체는 +4.43%의 speedup을 보고한다. 세 값은 각 집합의 평균이다.</p>
+    </div>
+    <div class="callout caution">
+      <strong>확인되지 않은 것</strong>
+      <p>루프의 시작과 끝을 어떻게 알아내는지, 저장한 결과를 언제 무효로 하는지, 재사용 여부를 가르는 confidence가 있는지, 어떤 시뮬레이터와 코어 모델에서 평가했는지, MPKI가 얼마나 줄었는지는 초록에서 확인되지 않는다. 이 책은 이 부분을 추측해서 채우지 않는다.</p>
+    </div>
+    <p>초록의 범위에서 말할 수 있는 한계는 적용 대상이 좁다는 점이다. 재사용할 수 있는 분기는 취소 전에 실행을 마쳤고, 오예측한 분기와 제어 흐름으로도 데이터로도 무관한 분기로 한정된다. 오예측한 분기가 바꾼 값에 의존하는 분기는 다시 실행하면 결과가 달라질 수 있다.</p>
+  </section>
+
+  <!-- ============================================================ 4 -->
+  <section id="together">
+    <h2>두 접근을 나란히 놓으면</h2>
+    <p>APF와 SBRB는 같은 순간, 곧 오예측이 확인된 직후를 다루지만 줄이는 것이 다르다. 아래 표는 우열이 아니라 역할의 차이를 정리한 것이다. 두 논문은 workload 구성과 코어 모델이 다르므로 speedup 숫자를 직접 비교할 수 없다.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th></th><th>Alternate Path Fetch</th><th>SBRB</th></tr></thead>
+      <tbody>
+        <tr><td><strong>줄이는 것</strong></td><td>오예측 뒤 frontend를 다시 채우는 시간</td><td>올바른 경로에서 같은 분기를 다시 예측하다 생기는 오예측</td></tr>
+        <tr><td><strong>미리 해 두는 일</strong></td><td>반대 경로를 예측, fetch, decode해서 buffer에 보관</td><td>실행된 분기의 결과를 반복 위치와 함께 보관</td></tr>
+        <tr><td><strong>처음의 오예측</strong></td><td>그대로 일어난다</td><td>그대로 일어난다</td></tr>
+        <tr><td><strong>효과가 없는 경우</strong></td><td>예측이 맞았을 때, 준비할 틈 없이 분기가 확인되었을 때</td><td>취소 전에 실행을 마치지 못한 분기, 오예측한 분기에 의존하는 분기</td></tr>
+        <tr><td><strong>논문이 밝힌 추가 비용</strong></td><td class="number">면적 약 2%, buffer 3.2KB</td><td class="number">11KB (초록)</td></tr>
+        <tr><td><strong>논문이 보고한 speedup</strong></td><td class="number">기하평균 약 5%<br>8-wide, SPEC2017 정수 + GAP</td><td class="number">전체 +4.43%<br>SPEC2006·2017 정수 + GAP (초록)</td></tr>
+        <tr><td><strong>근거 범위</strong></td><td>논문 전문</td><td>공개 초록</td></tr>
+      </tbody>
+    </table></div>
+    <p>다음 장은 방향을 바꿔, 예측이 맞더라도 <a href="latency.html">답이 늦게 나오는 문제</a>를 다룬다.</p>
+  </section>
+
+  <section id="summary" class="keypoints">
+    <h2>핵심 정리</h2>
+    <ol>
+      <li>오예측의 비용은 frontend를 다시 채우는 시간과, 취소되어 버려지는 일로 나눌 수 있다. 이 장의 두 기법은 오예측 횟수가 아니라 이 비용을 줄인다.</li>
+      <li>APF는 별도의 frontend로 H2P 분기의 반대 경로를 rename 직전까지 처리해 buffer에 두고, 틀리면 main pipeline에 넣는다. RAT에 접근하지 않으므로 상태 저장과 backend 부담이 없다.</li>
+      <li>준비한 경로는 분기가 틀렸을 때만 쓰인다. 대상을 넓게 잡으면 낭비와 자원 다툼이 늘고, 좁게 잡으면 오예측을 놓친다. 논문은 H2P Table과 TAGE confidence를 함께 쓴다.</li>
+      <li>APF 논문은 8-wide 코어, SPEC CPU2017 정수와 GAP에서 기하평균 약 5% speedup, 면적 약 2%를 보고한다. 같은 조건에서 16-wide 코어는 2.8%다.</li>
+      <li>SBRB는 취소되기 전에 실행을 마친 분기의 결과를 올바른 경로에서 다시 쓴다. 같은 주소가 아니라 같은 실행 instance를 찾아야 하며, 초록은 loop 반복 식별자를 LFSR signature와 작은 stack으로 구현한다고 밝힌다.</li>
+      <li>SBRB는 공개 초록만 확인되었다. 11KB 추가, 전체 +4.43%가 초록의 수치이고, 루프 감지, 무효화, confidence, 평가 환경은 확인되지 않았다.</li>
+    </ol>
+  </section>
+
+  <section id="quiz">
+    <h2>확인 퀴즈</h2>
+    <div class="quiz" id="chapter-quiz"></div>
+  </section>
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ============================================================ 실험 1: refill을 건너뛰기 */
+  (function setupRefillExperiment() {
+    // 논문의 APF pipeline 폭. 묶음 하나는 한 cycle에 가져오는 micro-op 8개다.
+    const MICRO_OPS_PER_PACKET = 8;
+    // 반대 경로가 처리하지 않고 남겨 두는 마지막 단계(RAT 접근)의 수
+    const RENAME_STAGE_COUNT = 2;
+    const EXTRA_CYCLES_SHOWN = 6;
+    const EXTRA_PACKETS_SHOWN = 3;
+    const MAXIMUM_ROW_HEIGHT = 13;
+    const STRIP_LABEL_HEIGHT = 18;
+    const STRIP_HEIGHT = 14;
+    const STRIP_GAP = 8;
+    const WAITING_OPACITY = 0.3;
+    const EARLY_STAGE_OPACITY = 0.45;
+    let layout = null;
+
+    function currentState() {
+      const depth = depthControl.value;
+      const alternateDepth = depth - RENAME_STAGE_COUNT;
+      const bufferedPacketCount = Math.floor(bufferControl.value / MICRO_OPS_PER_PACKET);
+      let preparedPacketCount = 0;
+      // 반대 경로 pipeline의 깊이보다 많은 묶음은 준비해 둘 수 없다.
+      if (preparedControl.checked) preparedPacketCount = Math.min(bufferedPacketCount, alternateDepth);
+      return { depth, alternateDepth, bufferedPacketCount, preparedPacketCount };
+    }
+    /** 묶음 하나가 rename에 들어가는 cycle. 오예측을 확인한 cycle을 0으로 센다. */
+    function renameEntryCycle(packetIndex, preparedPacketCount, alternateDepth) {
+      if (packetIndex < preparedPacketCount) return packetIndex + 1;
+      return packetIndex - preparedPacketCount + alternateDepth + 1;
+    }
+    /** 어떤 cycle에 rename에 들어가는 묶음의 종류: "prepared", "fetched", 또는 빈 cycle이면 null */
+    function entryKindAtCycle(cycle, preparedPacketCount, alternateDepth) {
+      if (cycle >= 1 && cycle <= preparedPacketCount) return "prepared";
+      if (cycle >= alternateDepth + 1) return "fetched";
+      return null;
+    }
+    function refresh() {
+      const state = currentState();
+      const baselineEntry = renameEntryCycle(0, 0, state.alternateDepth);
+      const currentEntry = renameEntryCycle(0, state.preparedPacketCount, state.alternateDepth);
+      BranchBook.setContent("refill-baseline", "cycle " + baselineEntry);
+      BranchBook.setContent("refill-current", "cycle " + currentEntry);
+      BranchBook.setContent("refill-saved", state.preparedPacketCount + "<small>cycle · micro-op " + state.preparedPacketCount * MICRO_OPS_PER_PACKET + "개</small>");
+      BranchBook.setContent("refill-bubble", (state.alternateDepth - state.preparedPacketCount) + "<small>cycle</small>");
+      bufferControl.input.disabled = !preparedControl.checked;
+      refillCanvas.redraw();
+    }
+    function formatBuffer(value) {
+      return value + "개 · " + Math.floor(value / MICRO_OPS_PER_PACKET) + " cycle분";
+    }
+    const depthControl = BranchBook.bindRange("refill-depth", (value) => value + "단계", refresh);
+    const bufferControl = BranchBook.bindRange("refill-buffer", formatBuffer, refresh);
+    const preparedControl = BranchBook.bindCheckbox("refill-prepared", refresh);
+
+    function drawStrip(context, palette, stripTop, title, preparedPacketCount, alternateDepth, cycleCount, cycleX, cellWidth) {
+      context.fillStyle = palette.textDim; context.font = "12px " + palette.font; context.textAlign = "left"; context.textBaseline = "middle";
+      context.fillText(title, cycleX(0), stripTop + STRIP_LABEL_HEIGHT / 2);
+      for (let cycle = 1; cycle < cycleCount; cycle++) {
+        const kind = entryKindAtCycle(cycle, preparedPacketCount, alternateDepth);
+        const cellX = cycleX(cycle) + 1;
+        const cellY = stripTop + STRIP_LABEL_HEIGHT;
+        BranchBook.roundedRectangle(context, cellX, cellY, Math.max(2, cellWidth - 2), STRIP_HEIGHT, 3);
+        if (kind === null) {
+          context.strokeStyle = palette.textFaint; context.lineWidth = 1;
+          context.stroke();
+          continue;
+        }
+        context.fillStyle = kind === "prepared" ? palette.series[2] : palette.series[0];
+        context.fill();
+      }
+    }
+    const refillCanvas = BranchBook.createCanvas("refill-canvas", (context, width, height, palette) => {
+      const state = currentState();
+      const cycleCount = state.depth + EXTRA_CYCLES_SHOWN;
+      const packetCount = state.alternateDepth + EXTRA_PACKETS_SHOWN;
+      const left = 6;
+      const top = 24;
+      const cellWidth = (width - 2 * left) / cycleCount;
+      const stripBlockHeight = 2 * (STRIP_LABEL_HEIGHT + STRIP_HEIGHT) + STRIP_GAP;
+      const rowHeight = Math.min(MAXIMUM_ROW_HEIGHT, (height - top - stripBlockHeight - 16) / packetCount);
+      const rowsBottom = top + packetCount * rowHeight;
+      const cycleX = (cycle) => left + cycle * cellWidth;
+      layout = { left, cellWidth, cycleCount, rowsBottom };
+
+      // 오예측을 확인한 cycle 0을 옅게 칠한다.
+      context.fillStyle = palette.accentSoft;
+      context.fillRect(cycleX(0), top - 4, cellWidth, rowsBottom - top + 8);
+      context.font = "11px " + palette.mono; context.fillStyle = palette.textDim; context.textAlign = "center"; context.textBaseline = "middle";
+      const labelStep = cellWidth < 16 ? 4 : 2;
+      for (let cycle = 0; cycle < cycleCount; cycle += labelStep) context.fillText(String(cycle), cycleX(cycle) + cellWidth / 2, top - 13);
+
+      context.save();
+      context.beginPath(); context.rect(left, top - 4, width - 2 * left, rowsBottom - top + 8); context.clip();
+      for (let packetIndex = 0; packetIndex < packetCount; packetIndex++) {
+        const isPrepared = packetIndex < state.preparedPacketCount;
+        const entryCycle = renameEntryCycle(packetIndex, state.preparedPacketCount, state.alternateDepth);
+        // 준비된 묶음은 cycle 0부터 buffer에서 기다린다. 새 묶음은 rename 이전 단계를 지나는 데 alternateDepth cycle이 든다.
+        const earlyStartCycle = isPrepared ? 0 : entryCycle - state.alternateDepth;
+        const rowY = top + packetIndex * rowHeight + 1;
+        const barHeight = Math.max(2, rowHeight - 2);
+        context.fillStyle = isPrepared ? palette.series[2] : palette.series[0];
+        context.globalAlpha = isPrepared ? WAITING_OPACITY : EARLY_STAGE_OPACITY;
+        context.fillRect(cycleX(earlyStartCycle) + 1, rowY, (entryCycle - earlyStartCycle) * cellWidth - 1, barHeight);
+        context.globalAlpha = 1;
+        BranchBook.roundedRectangle(context, cycleX(entryCycle) + 1, rowY, RENAME_STAGE_COUNT * cellWidth - 2, barHeight, 3);
+        context.fill();
+      }
+      context.restore();
+
+      const firstStripTop = rowsBottom + 12;
+      drawStrip(context, palette, firstStripTop, "rename에 들어가는 묶음 · 준비 없음", 0, state.alternateDepth, cycleCount, cycleX, cellWidth);
+      drawStrip(context, palette, firstStripTop + STRIP_LABEL_HEIGHT + STRIP_HEIGHT + STRIP_GAP, "rename에 들어가는 묶음 · 지금 설정", state.preparedPacketCount, state.alternateDepth, cycleCount, cycleX, cellWidth);
+    });
+    function describeEntry(kind) {
+      if (kind === "prepared") return "buffer의 묶음이 들어감";
+      if (kind === "fetched") return "새로 가져온 묶음이 들어감";
+      return "빈 cycle";
+    }
+    BranchBook.attachTooltip("refill-canvas", (x, y) => {
+      if (!layout) return null;
+      const cycle = Math.floor((x - layout.left) / layout.cellWidth);
+      if (cycle < 0 || cycle >= layout.cycleCount) return null;
+      if (cycle === 0) return { x, y: Math.min(y, layout.rowsBottom), html: "cycle <b>0</b> · 오예측을 확인한 cycle" };
+      const state = currentState();
+      const baselineKind = entryKindAtCycle(cycle, 0, state.alternateDepth);
+      const currentKind = entryKindAtCycle(cycle, state.preparedPacketCount, state.alternateDepth);
+      return { x, y: Math.min(y, layout.rowsBottom), html: "cycle <b>" + cycle + "</b> · 준비 없음: " + describeEntry(baselineKind) + " · 지금 설정: " + describeEntry(currentKind) };
+    });
+    refresh();
+  })();
+
+  /* ============================================================ 실험 2: 준비 대상 고르기 */
+  (function setupSelectionExperiment() {
+    const BRANCH_COUNT = 36;
+    const POPULATION_SEED = 3;
+    // 오예측 확률은 대부분 낮고 몇 개만 높게 나오도록 난수를 거듭제곱해 치우치게 한다.
+    const MINIMUM_MISPREDICTION_PROBABILITY = 0.004;
+    const MISPREDICTION_PROBABILITY_SPREAD = 0.46;
+    const SKEW_EXPONENT = 3.2;
+    const MINIMUM_EXECUTION_WEIGHT = 0.4;
+    const EXECUTION_WEIGHT_SPREAD = 1.2;
+    // 확인을 기다리며 동시에 떠 있는 분기의 평균 수
+    const IN_FLIGHT_BRANCH_COUNT = 16;
+    const SAVED_CYCLES_PER_USED_PATH = 13;
+    const MAXIMUM_THRESHOLD_PERCENT = 45;
+    const PERCENT = 100;
+    const POPULATION_MAXIMUM_PERCENT = 50;
+    const CHART_MINIMUM_PERCENT = -40;
+    const CHART_MAXIMUM_PERCENT = 100;
+
+    const random = BranchBook.createRandom(POPULATION_SEED);
+    const branches = [];
+    for (let branchIndex = 0; branchIndex < BRANCH_COUNT; branchIndex++) {
+      const skewedDraw = Math.pow(random(), SKEW_EXPONENT);
+      branches.push({
+        mispredictionProbability: MINIMUM_MISPREDICTION_PROBABILITY + MISPREDICTION_PROBABILITY_SPREAD * skewedDraw,
+        executionWeight: MINIMUM_EXECUTION_WEIGHT + EXECUTION_WEIGHT_SPREAD * random(),
+      });
+    }
+    branches.sort((first, second) => second.mispredictionProbability - first.mispredictionProbability);
+    const totalWeight = branches.reduce((sum, branch) => sum + branch.executionWeight, 0);
+    const totalMispredictions = branches.reduce((sum, branch) => sum + branch.executionWeight * branch.mispredictionProbability, 0);
+
+    /** 표시 기준 하나에 대해 적중, 낭비, 순이득을 계산한다. 비율은 모두 0~1이다. */
+    function evaluate(threshold, bufferCount, wasteCycles) {
+      let markedCount = 0;
+      let markedWeight = 0;
+      let markedMispredictions = 0;
+      branches.forEach((branch) => {
+        if (branch.mispredictionProbability < threshold) return;
+        markedCount++;
+        markedWeight += branch.executionWeight;
+        markedMispredictions += branch.executionWeight * branch.mispredictionProbability;
+      });
+      if (markedCount === 0) return { markedCount, preparedShare: 0, coverage: 0, wastage: null, netBenefit: 0 };
+      // 표시된 분기가 buffer보다 많이 떠 있으면 그중 일부만 준비된 경로를 얻는다.
+      const markedInFlightCount = IN_FLIGHT_BRANCH_COUNT * (markedWeight / totalWeight);
+      const preparedShare = Math.min(1, bufferCount / markedInFlightCount);
+      const unusedWeight = markedWeight - markedMispredictions;
+      const savedCycles = preparedShare * markedMispredictions * SAVED_CYCLES_PER_USED_PATH;
+      const wastedCycles = preparedShare * unusedWeight * wasteCycles;
+      return {
+        markedCount, preparedShare,
+        coverage: (preparedShare * markedMispredictions) / totalMispredictions,
+        wastage: unusedWeight / markedWeight,
+        netBenefit: (savedCycles - wastedCycles) / (totalMispredictions * SAVED_CYCLES_PER_USED_PATH),
+      };
+    }
+    function currentThreshold() {
+      return thresholdControl.value / PERCENT;
+    }
+    function refresh() {
+      const result = evaluate(currentThreshold(), buffersControl.value, wasteControl.value);
+      BranchBook.setContent("select-marked", result.markedCount + "<small>/ " + BRANCH_COUNT + "</small>");
+      BranchBook.setContent("select-coverage", BranchBook.formatPercent(result.coverage, 0));
+      BranchBook.setContent("select-wastage", result.wastage === null ? "—" : BranchBook.formatPercent(result.wastage, 0));
+      BranchBook.setContent("select-benefit", BranchBook.formatPercent(result.netBenefit, 0));
+      populationCanvas.redraw();
+      selectionCanvas.redraw();
+    }
+    const thresholdControl = BranchBook.bindRange("select-threshold", (value) => value + "% 이상", refresh);
+    const buffersControl = BranchBook.bindRange("select-buffers", (value) => value + "개", refresh);
+    const wasteControl = BranchBook.bindRange("select-waste", (value) => value.toFixed(2) + " cycle", refresh);
+
+    let populationChart = null;
+    const populationCanvas = BranchBook.createCanvas("select-population-canvas", (context, width, height, palette) => {
+      const chart = BranchBook.drawChart(context, { x: 56, y: 10, width: width - 74, height: height - 44 }, {
+        xMinimum: 0, xMaximum: BRANCH_COUNT, yMinimum: 0, yMaximum: POPULATION_MAXIMUM_PERCENT,
+        xTicks: [], yTicks: 2, hideXGrid: true, xLabel: "", yLabel: "오예측 확률 (%)",
+        yFormat: (value) => value.toFixed(0),
+      });
+      populationChart = chart;
+      const threshold = currentThreshold();
+      const slotWidth = chart.bounds.width / BRANCH_COUNT;
+      branches.forEach((branch, branchIndex) => {
+        const isMarked = branch.mispredictionProbability >= threshold;
+        const barHeight = Math.max(1.5, chart.toY(0) - chart.toY(branch.mispredictionProbability * PERCENT));
+        BranchBook.drawBar(context, chart.toX(branchIndex) + 1, chart.toY(0), Math.max(2, slotWidth - 2), barHeight, isMarked ? palette.accent : palette.surfaceStrong);
+      });
+      const thresholdY = chart.toY(threshold * PERCENT);
+      context.strokeStyle = palette.text; context.lineWidth = 1.2; context.setLineDash([5, 4]);
+      context.beginPath(); context.moveTo(chart.bounds.x, thresholdY); context.lineTo(chart.bounds.x + chart.bounds.width, thresholdY); context.stroke();
+      context.setLineDash([]);
+      context.fillStyle = palette.text; context.font = "600 12px " + palette.font; context.textAlign = "right"; context.textBaseline = "bottom";
+      context.fillText("표시 기준 " + thresholdControl.value + "%", chart.bounds.x + chart.bounds.width - 2, Math.max(chart.bounds.y + 14, thresholdY - 3));
+      context.fillStyle = palette.textDim; context.font = "12px " + palette.font; context.textAlign = "center"; context.textBaseline = "top";
+      context.fillText("분기 (오예측 확률이 높은 순)", chart.bounds.x + chart.bounds.width / 2, chart.bounds.y + chart.bounds.height + 10);
+    });
+    BranchBook.attachTooltip("select-population-canvas", (x) => {
+      if (!populationChart) return null;
+      const bounds = populationChart.bounds;
+      const branchIndex = Math.floor(((x - bounds.x) / bounds.width) * BRANCH_COUNT);
+      if (branchIndex < 0 || branchIndex >= BRANCH_COUNT) return null;
+      const branch = branches[branchIndex];
+      const isMarked = branch.mispredictionProbability >= currentThreshold();
+      return {
+        x, y: populationChart.toY(branch.mispredictionProbability * PERCENT),
+        html: "분기 " + (branchIndex + 1) + " · 오예측 확률 <b>" + BranchBook.formatPercent(branch.mispredictionProbability) + "</b> · 실행 빈도 <b>" + branch.executionWeight.toFixed(2) + "</b> · " + (isMarked ? "표시됨" : "표시 안 됨"),
+      };
+    });
+
+    let selectionChart = null;
+    const selectionCanvas = BranchBook.createCanvas("select-chart-canvas", (context, width, height, palette) => {
+      const chart = BranchBook.drawChart(context, { x: 56, y: 12, width: width - 74, height: height - 60 }, {
+        xMinimum: 0, xMaximum: MAXIMUM_THRESHOLD_PERCENT, yMinimum: CHART_MINIMUM_PERCENT, yMaximum: CHART_MAXIMUM_PERCENT,
+        xTicks: [0, 15, 30, 45], yTicks: 7, xLabel: "표시 기준: 오예측 확률 (%)", yLabel: "비율 (%)",
+        xFormat: (value) => value.toFixed(0), yFormat: (value) => value.toFixed(0),
+      });
+      selectionChart = chart;
+      context.strokeStyle = palette.axis; context.lineWidth = 1.2;
+      context.beginPath(); context.moveTo(chart.bounds.x, chart.toY(0)); context.lineTo(chart.bounds.x + chart.bounds.width, chart.toY(0)); context.stroke();
+      const coverageCurve = [];
+      const wastageCurve = [];
+      const benefitCurve = [];
+      for (let thresholdPercent = 0; thresholdPercent <= MAXIMUM_THRESHOLD_PERCENT; thresholdPercent++) {
+        const result = evaluate(thresholdPercent / PERCENT, buffersControl.value, wasteControl.value);
+        coverageCurve.push([thresholdPercent, result.coverage * PERCENT]);
+        benefitCurve.push([thresholdPercent, result.netBenefit * PERCENT]);
+        if (result.wastage !== null) wastageCurve.push([thresholdPercent, result.wastage * PERCENT]);
+      }
+      BranchBook.drawLine(context, chart, wastageCurve, palette.series[1], { dashed: true });
+      BranchBook.drawLine(context, chart, coverageCurve, palette.series[0]);
+      BranchBook.drawLine(context, chart, benefitCurve, palette.series[2], { lineWidth: 3 });
+      // 현재 기준을 세로선과 세 곡선 위의 점으로 표시한다.
+      const current = evaluate(currentThreshold(), buffersControl.value, wasteControl.value);
+      const markerX = chart.toX(thresholdControl.value);
+      context.strokeStyle = palette.text; context.lineWidth = 1; context.setLineDash([4, 4]);
+      context.beginPath(); context.moveTo(markerX, chart.bounds.y); context.lineTo(markerX, chart.bounds.y + chart.bounds.height); context.stroke();
+      context.setLineDash([]);
+      const markers = [
+        { value: current.coverage, color: palette.series[0] },
+        { value: current.netBenefit, color: palette.series[2] },
+      ];
+      if (current.wastage !== null) markers.push({ value: current.wastage, color: palette.series[1] });
+      markers.forEach((marker) => {
+        context.fillStyle = marker.color; context.strokeStyle = palette.background; context.lineWidth = 2;
+        context.beginPath(); context.arc(markerX, chart.toY(BranchBook.clamp(marker.value * PERCENT, CHART_MINIMUM_PERCENT, CHART_MAXIMUM_PERCENT)), 5, 0, Math.PI * 2); context.fill(); context.stroke();
+      });
+    });
+    BranchBook.attachTooltip("select-chart-canvas", (x) => {
+      if (!selectionChart) return null;
+      const bounds = selectionChart.bounds;
+      if (x < bounds.x || x > bounds.x + bounds.width) return null;
+      const thresholdPercent = Math.round(((x - bounds.x) / bounds.width) * MAXIMUM_THRESHOLD_PERCENT);
+      const result = evaluate(thresholdPercent / PERCENT, buffersControl.value, wasteControl.value);
+      const wastageText = result.wastage === null ? "—" : BranchBook.formatPercent(result.wastage, 0);
+      return {
+        x: selectionChart.toX(thresholdPercent), y: selectionChart.toY(Math.max(result.coverage, result.netBenefit) * PERCENT),
+        html: "기준 <b>" + thresholdPercent + "%</b> · 적중 <b>" + BranchBook.formatPercent(result.coverage, 0) + "</b> · 낭비 <b>" + wastageText + "</b> · 순이득 <b>" + BranchBook.formatPercent(result.netBenefit, 0) + "</b>",
+      };
+    });
+    refresh();
+  })();
+
+  /* ============================================================ 실험 3: 취소된 결과를 다시 쓰기 */
+  (function setupReuseExperiment() {
+    // 바깥 반복 2에서 B0를 잘못 예측한 뒤 fetch된 J의 instance들. 값은 설명을 위해 정해 둔 것이다.
+    const INSTANCES = [
+      { outerIteration: 2, innerIteration: 0, isActualTaken: true, isExecutedBeforeSquash: true, isBasePredictionTaken: false },
+      { outerIteration: 2, innerIteration: 1, isActualTaken: true, isExecutedBeforeSquash: true, isBasePredictionTaken: true },
+      { outerIteration: 2, innerIteration: 2, isActualTaken: false, isExecutedBeforeSquash: true, isBasePredictionTaken: true },
+      { outerIteration: 2, innerIteration: 3, isActualTaken: false, isExecutedBeforeSquash: true, isBasePredictionTaken: false },
+      { outerIteration: 3, innerIteration: 0, isActualTaken: true, isExecutedBeforeSquash: false, isBasePredictionTaken: false },
+    ];
+    // 단계 번호: 1은 B0 예측, 그 뒤 instance마다 한 단계씩 실행, 이어서 B0 확인, 그 뒤 instance마다 한 단계씩 다시 fetch.
+    const PREDICT_STEP = 1;
+    const FIRST_EXECUTE_STEP = 2;
+    const SQUASH_STEP = FIRST_EXECUTE_STEP + INSTANCES.length;
+    const FIRST_REFETCH_STEP = SQUASH_STEP + 1;
+    const LAST_STEP = SQUASH_STEP + INSTANCES.length;
+    const INITIAL_STEP = FIRST_REFETCH_STEP + 1;
+    const AUTOMATIC_STEP_SECONDS = 1.3;
+    let currentStep = INITIAL_STEP;
+
+    function instanceName(instance) {
+      return "J(" + instance.outerIteration + "," + instance.innerIteration + ")";
+    }
+    function directionLetter(isTaken) {
+      return isTaken ? "T" : "N";
+    }
+    function chipHtml(isTaken, isWrong) {
+      let className = "outcome-cell " + (isTaken ? "taken" : "not-taken");
+      if (isWrong) className += " mispredicted";
+      return '<span class="' + className + '">' + directionLetter(isTaken) + "</span>";
+    }
+    function executedInstances() {
+      return INSTANCES.filter((instance) => instance.isExecutedBeforeSquash);
+    }
+    /** 선택한 방식에서, 다시 fetch한 instance 하나에 쓰는 예측과 그 출처를 정한다. */
+    function resolvePrediction(instance) {
+      const policy = policyControl.value;
+      const basePrediction = { isTaken: instance.isBasePredictionTaken, isReused: false, source: "기본 예측기" };
+      if (policy === "none") return basePrediction;
+      if (policy === "address") {
+        // 주소마다 하나만 기억하므로, 마지막으로 실행된 instance의 결과가 남아 있다.
+        const executed = executedInstances();
+        const lastExecuted = executed[executed.length - 1];
+        return { isTaken: lastExecuted.isActualTaken, isReused: true, source: instanceName(lastExecuted) + "의 결과 (PC가 같음)" };
+      }
+      if (instance.isExecutedBeforeSquash) return { isTaken: instance.isActualTaken, isReused: true, source: instanceName(instance) + "의 결과 (위치가 같음)" };
+      return { isTaken: instance.isBasePredictionTaken, isReused: false, source: "buffer에 없음, 기본 예측기" };
+    }
+    function bufferDescription() {
+      const policy = policyControl.value;
+      if (policy === "none") return "결과를 남기지 않는다.";
+      const executed = executedInstances().filter((instance, instanceIndex) => currentStep >= FIRST_EXECUTE_STEP + instanceIndex);
+      if (executed.length === 0) return "아직 비어 있다.";
+      if (policy === "address") {
+        const lastExecuted = executed[executed.length - 1];
+        return "<code>J → " + directionLetter(lastExecuted.isActualTaken) + "</code> 하나. 같은 주소의 새 결과가 앞의 것을 덮어썼다.";
+      }
+      return executed.map((instance) => "<code>" + instanceName(instance) + " → " + directionLetter(instance.isActualTaken) + "</code>").join(" ");
+    }
+    function olderBranchDescription() {
+      if (currentStep < PREDICT_STEP) return "아직 fetch하지 않았다.";
+      if (currentStep < SQUASH_STEP) return "not-taken으로 예측하고 계속 진행 중이다. 실제 방향은 아직 모른다.";
+      return "실제는 taken이었다. 오예측을 확인하고 뒤의 명령을 모두 취소했다(✕).";
+    }
+    function rowHtml(instance, instanceIndex) {
+      const executeStep = FIRST_EXECUTE_STEP + instanceIndex;
+      const refetchStep = FIRST_REFETCH_STEP + instanceIndex;
+      const isFetched = currentStep >= executeStep;
+      const isRefetched = currentStep >= refetchStep;
+      const isCurrent = currentStep === executeStep || currentStep === refetchStep;
+      let beforeCell = "·";
+      if (isFetched && instance.isExecutedBeforeSquash) beforeCell = chipHtml(instance.isActualTaken, false);
+      if (isFetched && !instance.isExecutedBeforeSquash) beforeCell = "실행 전";
+      let predictionCell = "·";
+      let sourceCell = "";
+      let actualCell = "·";
+      if (isRefetched) {
+        const prediction = resolvePrediction(instance);
+        predictionCell = chipHtml(prediction.isTaken, prediction.isTaken !== instance.isActualTaken);
+        sourceCell = prediction.source;
+        actualCell = chipHtml(instance.isActualTaken, false);
+      }
+      let rowClass = "";
+      if (!isFetched) rowClass = "pending-row";
+      if (isCurrent) rowClass = "current-row";
+      return '<tr class="' + rowClass + '"><td>J</td><td class="identifier-cell">(' + instance.outerIteration + ", " + instance.innerIteration + ")</td><td>" + beforeCell + "</td><td>" + predictionCell + '</td><td class="source-cell">' + sourceCell + "</td><td>" + actualCell + "</td></tr>";
+    }
+    function describeStep() {
+      if (currentStep < PREDICT_STEP) return "바깥 반복 2가 시작된다. \"한 단계\"를 눌러 B0를 fetch하자.";
+      if (currentStep === PREDICT_STEP) return "<b>B0를 예측한다.</b> B0가 읽을 값이 아직 오지 않아 한참 뒤에야 확인된다. 프로세서는 not-taken이라고 보고 계속 가져온다.";
+      if (currentStep < SQUASH_STEP) {
+        const instance = INSTANCES[currentStep - FIRST_EXECUTE_STEP];
+        if (instance.isExecutedBeforeSquash) return "<b>" + instanceName(instance) + "가 실행을 마친다.</b> 결과는 " + directionLetter(instance.isActualTaken) + "다. B0는 아직 확인되지 않았다.";
+        return "<b>" + instanceName(instance) + "를 fetch했다.</b> 아직 실행하지 못했는데 다음 단계에서 B0가 확인된다.";
+      }
+      if (currentStep === SQUASH_STEP) return "<b>B0가 확인된다. 틀렸다.</b> 뒤에 가져온 J의 instance 다섯 개가 모두 취소된다. 그중 넷은 이미 결과가 나와 있었다. 이제 올바른 경로에서 같은 J들을 다시 fetch한다.";
+      const instance = INSTANCES[currentStep - FIRST_REFETCH_STEP];
+      const prediction = resolvePrediction(instance);
+      const isWrong = prediction.isTaken !== instance.isActualTaken;
+      let text = "<b>" + instanceName(instance) + "를 다시 fetch한다.</b> ";
+      if (prediction.isReused) text += prediction.source + "를 가져와 " + directionLetter(prediction.isTaken) + "로 예측한다. ";
+      else text += prediction.source + "의 예측 " + directionLetter(prediction.isTaken) + "를 쓴다. ";
+      text += isWrong ? "실제는 " + directionLetter(instance.isActualTaken) + "라서 틀렸다(✕)." : "실제와 같다.";
+      return text;
+    }
+    function refresh() {
+      document.getElementById("reuse-rows").innerHTML = INSTANCES.map(rowHtml).join("");
+      BranchBook.setContent("reuse-status", "<div><b>B0 (바깥 반복 2)</b> " + olderBranchDescription() + "</div><div><b>buffer에 남은 것</b> " + bufferDescription() + "</div>");
+      BranchBook.setContent("reuse-narration", describeStep());
+      const refetchedInstances = INSTANCES.filter((instance, instanceIndex) => currentStep >= FIRST_REFETCH_STEP + instanceIndex);
+      const predictions = refetchedInstances.map((instance) => ({ instance, prediction: resolvePrediction(instance) }));
+      const reusedPredictions = predictions.filter((entry) => entry.prediction.isReused);
+      const wrongReuseCount = reusedPredictions.filter((entry) => entry.prediction.isTaken !== entry.instance.isActualTaken).length;
+      const mispredictionCount = predictions.filter((entry) => entry.prediction.isTaken !== entry.instance.isActualTaken).length;
+      BranchBook.setContent("reuse-progress", currentStep + "<small>/ " + LAST_STEP + "</small>");
+      BranchBook.setContent("reuse-reused", reusedPredictions.length + "<small>개</small>");
+      BranchBook.setContent("reuse-wrong", wrongReuseCount + "<small>개</small>");
+      BranchBook.setContent("reuse-mispredictions", refetchedInstances.length === 0 ? "—" : mispredictionCount + "<small>/ " + refetchedInstances.length + "</small>");
+    }
+    const policyControl = BranchBook.bindSegmented("reuse-policy", refresh);
+
+    // 한 단계 / 자동 실행 / 처음부터
+    const playButton = document.getElementById("reuse-play");
+    const stepButton = document.getElementById("reuse-step");
+    let secondsSinceLastStep = 0;
+    function refreshButtons() {
+      playButton.textContent = automaticRun.isPlaying ? "멈춤" : "자동 실행";
+      stepButton.disabled = currentStep >= LAST_STEP;
+    }
+    function stopAutomaticRun() {
+      automaticRun.pause();
+      refreshButtons();
+    }
+    function stepOnce() {
+      if (currentStep < LAST_STEP) currentStep++;
+      refresh();
+      if (currentStep >= LAST_STEP) stopAutomaticRun();
+      refreshButtons();
+    }
+    const automaticRun = BranchBook.createAnimationLoop("simulator-reuse", (deltaSeconds) => {
+      secondsSinceLastStep += deltaSeconds;
+      if (secondsSinceLastStep < AUTOMATIC_STEP_SECONDS) return;
+      secondsSinceLastStep = 0;
+      stepOnce();
+    }, { autoStart: false });
+    BranchBook.bindButton("reuse-step", () => { stopAutomaticRun(); stepOnce(); });
+    BranchBook.bindButton("reuse-play", () => {
+      if (automaticRun.isPlaying) { stopAutomaticRun(); return; }
+      // 끝까지 간 상태에서 자동 실행을 누르면 처음부터 다시 보여 준다.
+      if (currentStep >= LAST_STEP) { currentStep = 0; refresh(); }
+      secondsSinceLastStep = 0;
+      automaticRun.play();
+      refreshButtons();
+    });
+    BranchBook.bindButton("reuse-reset", () => { stopAutomaticRun(); currentStep = 0; refresh(); refreshButtons(); });
+    refresh();
+    refreshButtons();
+  })();
+
+  /* ============================================================ 퀴즈 */
+  BranchBook.renderQuiz("chapter-quiz", [
+    {
+      question: "Alternate Path Fetch가 직접 줄이는 것은 무엇인가?",
+      options: ["H2P 분기의 오예측 횟수", "오예측이 확인된 뒤 올바른 경로의 명령이 backend에 들어가기까지의 refill 지연", "잘못된 경로에서 실행되는 명령 수", "분기예측기의 저장 공간"],
+      answerIndex: 1,
+      explanation: "APF는 예측한 경로만 실행하므로 오예측 횟수와 backend flush는 그대로다. 반대 경로를 미리 준비해 frontend를 다시 채우는 시간을 줄인다.",
+    },
+    {
+      question: "APF가 반대 경로의 명령을 rename(RAT 접근) 직전까지만 처리하는 이유는?",
+      options: ["decode가 가장 느린 단계이기 때문이다", "RAT에 접근하면 반대 경로마다 RAT와 free list의 상태를 저장해야 해서, 준비할 수 있는 분기 수가 크게 줄기 때문이다", "rename 이후에는 micro-op을 buffer에 넣을 수 없기 때문이다", "반대 경로의 명령은 register를 쓰지 않기 때문이다"],
+      answerIndex: 1,
+      explanation: "논문은 rename 이후까지 처리하는 DPIP와 비교한다. 분기 하나당 아끼는 시간은 늘지만 준비할 수 있는 분기가 줄어 전체 성능은 낮았다고 보고한다.",
+    },
+    {
+      question: "실험 2에서 표시 기준을 0%로 내려 모든 분기를 준비 대상으로 삼으면 적중이 오히려 떨어진다. 이유는?",
+      options: ["오예측 확률이 낮은 분기는 예측기가 무시하기 때문이다", "한정된 buffer를 잘 틀리지 않는 분기와 나눠 쓰느라, 실제로 틀리는 분기가 준비된 경로를 얻지 못하기 때문이다", "기준이 낮으면 오예측이 늘어나기 때문이다", "buffer가 넘쳐 프로그램이 멈추기 때문이다"],
+      answerIndex: 1,
+      explanation: "준비 자원은 한정되어 있다. 논문도 H2P로 너무 많은 분기를 표시하면 APF cycle이 여러 분기에 나뉘어 분기당 이득이 줄어든다고 설명한다.",
+    },
+    {
+      question: "SBRB가 취소된 분기의 결과를 다시 쓸 때, 분기의 PC만으로 짝을 지으면 안 되는 이유는?",
+      options: ["PC는 실행할 때마다 바뀌기 때문이다", "루프 안의 분기는 반복마다 같은 PC를 쓰므로, 다른 반복의 결과를 잘못 가져올 수 있기 때문이다", "PC는 64 bit라서 buffer에 넣을 수 없기 때문이다", "취소된 명령은 PC를 잃어버리기 때문이다"],
+      answerIndex: 1,
+      explanation: "같은 PC의 분기라도 반복마다 다른 데이터를 보는 다른 실행(dynamic instance)이다. 초록에 따르면 SBRB는 loop 반복 식별자를 signature로 만들어 PC와 함께 쓴다.",
+    },
+    {
+      question: "SBRB에 대해 이 책이 '확인되지 않음'으로 둔 것은?",
+      options: ["기본 예측기가 64KB TAGE-SC-L이라는 점", "추가 상태가 11KB라는 점", "저장한 결과를 언제 무효로 하는지와 어떤 시뮬레이터에서 평가했는지", "GAP에서 평균 +7.25%를 보고했다는 점"],
+      answerIndex: 2,
+      explanation: "이 논문은 공개 초록만 확인했다. 기본 예측기, 11KB, speedup 수치는 초록에 있다. 루프 감지 방법, 무효화 정책, confidence, 평가 환경은 초록에 없다.",
+    },
+  ]);
+})();
+</script>
+</body>
+</html>

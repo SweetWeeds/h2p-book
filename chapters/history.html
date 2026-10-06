@@ -1,0 +1,1115 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2장 · History와 TAGE — BranchBook</title>
+<meta name="description" content="과거 방향 기록으로 다음 방향을 배운다. bimodal, gshare, TAGE를 같은 분기열에서 겨뤄 보고, history 기반 예측의 세 가지 한계를 확인한다.">
+<link rel="icon" href="../favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/common.js"></script>
+<style>
+  /* 실험 1: 예측기마다 결과열을 한 줄씩 보여 주는 묶음 */
+  .strip-group { display: grid; gap: 4px; padding: 10px 6px 2px; }
+  .strip-caption { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--text-dim); margin-top: 6px; }
+  .strip-caption i { width: 12px; height: 12px; border-radius: 3px; flex: none; }
+  .view-caption { font-size: 13.5px; line-height: 1.6; color: var(--text-dim); margin: 0 4px 10px !important; }
+  input[type="range"]:disabled { opacity: 0.35; cursor: not-allowed; }
+</style>
+</head>
+<body data-root="../" data-chapter="history">
+<main class="chapter">
+  <header class="chapter-hero">
+    <p class="chapter-kicker"></p>
+    <h1>History와 TAGE</h1>
+    <p class="lead">카운터 하나는 "지난번과 같을 것"이라는 말밖에 하지 못한다. 직전에 무슨 일이 있었는지를 입력으로 주면, 번갈아 나오는 분기도 루프의 끝도 맞힐 수 있다. 이 장에서는 그 입력인 history와, history를 가장 잘 쓰는 예측기 TAGE를 본다. 그리고 history만으로는 넘지 못하는 벽이 어디인지 확인한다.</p>
+    <div class="objectives">
+      <p class="objectives-title">이 장에서 배우는 것</p>
+      <ul>
+        <li>history가 무엇이고, 왜 카운터 하나의 한계를 넘게 해 주는지 설명할 수 있다.</li>
+        <li>gshare가 history와 분기 주소를 섞어 카운터를 고르는 방식을 이해한다.</li>
+        <li>history가 짧아도 손해, 길어도 손해인 이유를 실험으로 확인한다.</li>
+        <li>TAGE의 구성 요소(길이가 다른 여러 표, tag, provider, 할당, useful)를 말할 수 있다.</li>
+        <li>history 기반 예측의 세 가지 한계(정보, 표현, 상태)를 구별한다.</li>
+      </ul>
+    </div>
+  </header>
+
+  <!-- ============================================================ 1 -->
+  <section id="history-input">
+    <h2>직전에 무슨 일이 있었는가</h2>
+    <p><a href="basics.html#counter">1장</a>은 번갈아 나오는 분기 T, N, T, N…에서 2-bit 카운터가 거의 다 틀리는 것으로 끝났다. 규칙은 분명하다. "직전이 T였으면 이번은 N"이다. 카운터가 이 규칙을 쓰지 못한 까닭은, 직전 결과를 입력으로 받지 않기 때문이다.</p>
+    <p>해법은 간단하다. 카운터를 분기마다 하나만 두지 말고, <strong>직전 상황마다 하나씩</strong> 둔다. "직전이 T일 때 쓰는 카운터"는 N 쪽으로, "직전이 N일 때 쓰는 카운터"는 T 쪽으로 굳는다. 두 카운터는 각자 한쪽으로 치우친 쉬운 분기를 맡게 된다.</p>
+    <p>이때 직전 상황을 적어 둔 기록을 <span class="term">history</span>라고 부른다. 예측기가 입력으로 쓰는 정보는 크게 세 가지다.</p>
+    <ul>
+      <li><span class="term">PC</span><span class="english">(program counter)</span>: 지금 예측하려는 분기 명령의 주소. 어느 분기인지 알려 준다.</li>
+      <li><span class="term">방향 history</span><span class="english">(direction history)</span>: 앞서 실행한 분기들이 taken이었는지 not-taken이었는지를 순서대로 적은 bit 열. 모든 분기의 방향을 한 줄에 적으면 <span class="term">global history</span>, 분기마다 자기 방향만 따로 적으면 <span class="term">local history</span>다.</li>
+      <li><span class="term">경로 history</span><span class="english">(path history)</span>: 어느 방향으로 갔는지가 아니라, 어떤 주소의 분기들을 지나왔는지를 적은 기록.</li>
+    </ul>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 280" role="img" aria-label="실행한 분기 여덟 개에서 방향 history와 경로 history를 뽑아 다음 분기의 예측에 쓰는 모습">
+        <defs><marker id="history-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrow-head"/></marker></defs>
+        <text x="20" y="74" class="label-strong">실행한 분기</text>
+        <text x="20" y="94" class="label-dim">오래된 것 → 최근</text>
+        <text x="20" y="140" class="label-strong">방향 history</text>
+        <text x="20" y="160" class="label-dim">어느 쪽으로 갔는가</text>
+        <text x="20" y="206" class="label-strong">경로 history</text>
+        <text x="20" y="226" class="label-dim">어디를 지나왔는가</text>
+        <g>
+          <rect x="170" y="56" width="52" height="44" rx="8" class="fill-surface"/><text x="196" y="83" text-anchor="middle" class="label">A·T</text>
+          <rect x="232" y="56" width="52" height="44" rx="8" class="fill-surface"/><text x="258" y="83" text-anchor="middle" class="label">B·N</text>
+          <rect x="294" y="56" width="52" height="44" rx="8" class="fill-surface"/><text x="320" y="83" text-anchor="middle" class="label">C·T</text>
+          <rect x="356" y="56" width="52" height="44" rx="8" class="fill-surface"/><text x="382" y="83" text-anchor="middle" class="label">A·T</text>
+          <rect x="418" y="56" width="52" height="44" rx="8" class="fill-surface"/><text x="444" y="83" text-anchor="middle" class="label">D·N</text>
+          <rect x="480" y="56" width="52" height="44" rx="8" class="fill-surface"/><text x="506" y="83" text-anchor="middle" class="label">B·T</text>
+          <rect x="542" y="56" width="52" height="44" rx="8" class="fill-surface"/><text x="568" y="83" text-anchor="middle" class="label">C·T</text>
+          <rect x="604" y="56" width="52" height="44" rx="8" class="fill-surface"/><text x="630" y="83" text-anchor="middle" class="label">A·N</text>
+        </g>
+        <g>
+          <rect x="170" y="122" width="52" height="44" rx="8" class="fill-taken"/><text x="196" y="149" text-anchor="middle" class="label-on-color">T</text>
+          <rect x="232" y="122" width="52" height="44" rx="8" class="fill-not-taken"/><text x="258" y="149" text-anchor="middle" class="label-on-color">N</text>
+          <rect x="294" y="122" width="52" height="44" rx="8" class="fill-taken"/><text x="320" y="149" text-anchor="middle" class="label-on-color">T</text>
+          <rect x="356" y="122" width="52" height="44" rx="8" class="fill-taken"/><text x="382" y="149" text-anchor="middle" class="label-on-color">T</text>
+          <rect x="418" y="122" width="52" height="44" rx="8" class="fill-not-taken"/><text x="444" y="149" text-anchor="middle" class="label-on-color">N</text>
+          <rect x="480" y="122" width="52" height="44" rx="8" class="fill-taken"/><text x="506" y="149" text-anchor="middle" class="label-on-color">T</text>
+          <rect x="542" y="122" width="52" height="44" rx="8" class="fill-taken"/><text x="568" y="149" text-anchor="middle" class="label-on-color">T</text>
+          <rect x="604" y="122" width="52" height="44" rx="8" class="fill-not-taken"/><text x="630" y="149" text-anchor="middle" class="label-on-color">N</text>
+        </g>
+        <g>
+          <rect x="170" y="188" width="52" height="44" rx="8" class="fill-elevated"/><text x="196" y="215" text-anchor="middle" class="label-mono">A</text>
+          <rect x="232" y="188" width="52" height="44" rx="8" class="fill-elevated"/><text x="258" y="215" text-anchor="middle" class="label-mono">B</text>
+          <rect x="294" y="188" width="52" height="44" rx="8" class="fill-elevated"/><text x="320" y="215" text-anchor="middle" class="label-mono">C</text>
+          <rect x="356" y="188" width="52" height="44" rx="8" class="fill-elevated"/><text x="382" y="215" text-anchor="middle" class="label-mono">A</text>
+          <rect x="418" y="188" width="52" height="44" rx="8" class="fill-elevated"/><text x="444" y="215" text-anchor="middle" class="label-mono">D</text>
+          <rect x="480" y="188" width="52" height="44" rx="8" class="fill-elevated"/><text x="506" y="215" text-anchor="middle" class="label-mono">B</text>
+          <rect x="542" y="188" width="52" height="44" rx="8" class="fill-elevated"/><text x="568" y="215" text-anchor="middle" class="label-mono">C</text>
+          <rect x="604" y="188" width="52" height="44" rx="8" class="fill-elevated"/><text x="630" y="215" text-anchor="middle" class="label-mono">A</text>
+        </g>
+        <path d="M662 144 H694" class="stroke-line" marker-end="url(#history-arrow)"/>
+        <path d="M662 210 H680 V176 H694" class="stroke-line" marker-end="url(#history-arrow)"/>
+        <rect x="700" y="110" width="144" height="92" rx="10" class="fill-accent-soft"/>
+        <text x="772" y="138" text-anchor="middle" class="label-strong">다음 분기</text>
+        <text x="772" y="160" text-anchor="middle" class="label">PC = X</text>
+        <text x="772" y="184" text-anchor="middle" class="label-accent">방향은 ?</text>
+        <text x="772" y="98" text-anchor="middle" class="label-dim">예측기의 입력</text>
+        <text x="430" y="264" text-anchor="middle" class="label-dim">A–D는 분기 주소, T와 N은 방향이다. 여기서는 최근 여덟 개만 그렸다.</text>
+      </svg>
+      <figcaption><b>그림 2-1.</b> 같은 실행 기록에서 뽑은 두 가지 history. 방향 history는 방향만, 경로 history는 주소만 남긴다. 예측기는 이 기록과 PC를 함께 보고 다음 방향을 고른다.</figcaption>
+    </figure>
+    <p>예측기가 배우는 것은 결국 다음과 같은 표다. "이 분기 앞에서 이런 기록이 보이면, 다음은 대개 이쪽이었다."</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>분기 위치</th><th>직전 history</th><th>관측된 다음 방향</th></tr></thead>
+      <tbody>
+        <tr><td>PC = X</td><td>T–N</td><td>주로 <span class="taken-text">T</span></td></tr>
+        <tr><td>PC = X</td><td>N–N</td><td>주로 <span class="not-taken-text">N</span></td></tr>
+        <tr><td>PC = Y</td><td>T–N</td><td>주로 <span class="not-taken-text">N</span></td></tr>
+      </tbody>
+    </table></div>
+    <p>같은 history T–N이라도 분기 X와 분기 Y에서 뜻이 다르다는 점을 눈여겨보자. 그래서 예측기는 history와 PC를 <em>함께</em> 써야 한다. 위 표는 이해를 돕기 위한 단순한 그림이다. 실제 예측기는 이런 표를 그대로 두지 못하고, hash와 tag, 카운터로 만든 크기가 정해진 구조에 눌러 담는다.</p>
+    <h3>다른 분기의 결과가 왜 도움이 되는가</h3>
+    <p>global history에는 지금 예측하려는 분기와 상관없어 보이는 다른 분기의 방향이 섞여 있다. 그런데 바로 그 점이 쓸모가 있다. 프로그램의 분기들은 같은 값을 보고 갈라지는 일이 많기 때문이다.</p>
+<pre><code>if (count &gt; 0) {            // 분기 A
+    total += count;
+}
+...
+if (count &gt; 0 &amp;&amp; isReady) { // 분기 B: A가 건너뛰었다면 B의 답도 정해진다
+    flush(total);
+}</code></pre>
+    <p>분기 B만 따로 보면 결과가 들쭉날쭉하다. 하지만 조금 전 분기 A가 어느 쪽으로 갔는지 알면 B의 절반은 이미 풀린다. 이렇게 한 분기의 방향이 다른 분기의 방향을 알려 주는 관계를 <span class="term">상관</span><span class="english">(correlation)</span>이라고 한다. history 기반 예측기는 모두 이 상관을 배우는 장치다.</p>
+  </section>
+
+  <!-- ============================================================ 2 -->
+  <section id="gshare">
+    <h2>gshare: history와 주소를 섞어 카운터를 고른다</h2>
+    <p>history를 쓰는 가장 단순한 예측기가 <span class="term">gshare</span>다. 1장의 카운터 표는 그대로 두고, 표에서 칸을 고르는 방법만 바꾼다. 분기 주소만으로 고르던 것을, 분기 주소와 global history를 <span class="term">XOR</span>한 값으로 고른다.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 260" role="img" aria-label="gshare의 구조: 분기 주소와 global history를 XOR해 2-bit 카운터 표의 한 칸을 고른다">
+        <defs><marker id="gshare-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrow-head"/></marker></defs>
+        <rect x="20" y="44" width="220" height="60" rx="10" class="fill-surface"/>
+        <text x="130" y="69" text-anchor="middle" class="label-strong">분기 주소 (PC)</text>
+        <text x="130" y="90" text-anchor="middle" class="label-mono">… 0110 1011 0100</text>
+        <rect x="20" y="160" width="220" height="60" rx="10" class="fill-surface"/>
+        <text x="130" y="185" text-anchor="middle" class="label-strong">global history</text>
+        <text x="130" y="206" text-anchor="middle" class="label-mono">T N T T N T N T</text>
+        <path d="M244 82 L290 116" class="stroke-line" marker-end="url(#gshare-arrow)"/>
+        <path d="M244 182 L290 148" class="stroke-line" marker-end="url(#gshare-arrow)"/>
+        <circle cx="322" cy="132" r="30" class="fill-accent-soft"/>
+        <text x="322" y="137" text-anchor="middle" class="label-strong">XOR</text>
+        <path d="M354 132 H388" class="stroke-line" marker-end="url(#gshare-arrow)"/>
+        <rect x="392" y="106" width="130" height="52" rx="10" class="fill-elevated"/>
+        <text x="457" y="128" text-anchor="middle" class="label-strong">색인</text>
+        <text x="457" y="147" text-anchor="middle" class="label-mono">하위 n bit</text>
+        <path d="M526 132 H574" class="stroke-accent" marker-end="url(#gshare-arrow)"/>
+        <text x="640" y="20" text-anchor="middle" class="label-dim">2-bit 카운터 표</text>
+        <rect x="580" y="29" width="120" height="26" rx="4" class="fill-surface"/><text x="640" y="47" text-anchor="middle" class="label-mono">01</text>
+        <rect x="580" y="59" width="120" height="26" rx="4" class="fill-surface"/><text x="640" y="77" text-anchor="middle" class="label-mono">11</text>
+        <rect x="580" y="89" width="120" height="26" rx="4" class="fill-surface"/><text x="640" y="107" text-anchor="middle" class="label-mono">00</text>
+        <rect x="580" y="119" width="120" height="26" rx="4" class="fill-accent-soft"/><text x="640" y="137" text-anchor="middle" class="label-strong">10</text>
+        <rect x="580" y="149" width="120" height="26" rx="4" class="fill-surface"/><text x="640" y="167" text-anchor="middle" class="label-mono">11</text>
+        <rect x="580" y="179" width="120" height="26" rx="4" class="fill-surface"/><text x="640" y="197" text-anchor="middle" class="label-mono">01</text>
+        <rect x="580" y="209" width="120" height="26" rx="4" class="fill-surface"/><text x="640" y="227" text-anchor="middle" class="label-mono">10</text>
+        <path d="M704 132 H742" class="stroke-line" marker-end="url(#gshare-arrow)"/>
+        <rect x="748" y="106" width="96" height="52" rx="10" class="fill-taken-soft"/>
+        <text x="796" y="128" text-anchor="middle" class="label-strong">예측</text>
+        <text x="796" y="147" text-anchor="middle" class="label-dim">10 → taken</text>
+      </svg>
+      <figcaption><b>그림 2-2.</b> gshare. 같은 분기라도 history가 다르면 다른 카운터를 쓴다. 표는 1장의 2-bit 카운터 표와 똑같다.</figcaption>
+    </figure>
+    <div class="formula">
+      $$ \text{색인} = \big(\text{PC} \oplus \text{history}\big) \bmod 2^{n} $$
+      <div class="formula-note">\( \oplus \)는 bit별 XOR, \( 2^{n} \)은 카운터 표의 칸 수다. history가 \( n \) bit보다 길면 접어서(여러 조각을 서로 XOR해서) 폭을 맞춘다.</div>
+    </div>
+    <p>XOR로 섞는 이유는 두 정보를 한 색인에 모두 담기 위해서다. 주소가 같고 history가 다르면 다른 칸으로, history가 같고 주소가 다르면 역시 다른 칸으로 간다. 대신 값을 치를 것이 있다. 서로 다른 (주소, history) 쌍이 같은 칸에 떨어질 수 있다. 이것을 <span class="term">aliasing</span>이라고 하고, 표가 작을수록, history가 다양할수록 자주 일어난다.</p>
+    <p>이제 세 예측기를 같은 분기열에 붙여 보자. <strong>bimodal</strong>은 1장의 방식 그대로 주소마다 카운터 하나를 둔다. <strong>gshare</strong>는 방금 본 구조다. <strong>TAGE</strong>는 이 장 뒤쪽에서 설명할 예측기인데, 우선 결과부터 본다.</p>
+
+    <div class="simulator" id="simulator-duel">
+      <div class="simulator-head"><span class="simulator-tag">실험 1</span><h3>예측기 대결</h3></div>
+      <div class="simulator-body side">
+        <div class="simulator-view">
+          <p class="view-caption" id="duel-description"></p>
+          <div class="legend"><span><i style="background:var(--series-1)"></i>bimodal</span><span><i style="background:var(--series-2)"></i>gshare</span><span><i style="background:var(--series-3)"></i>TAGE</span></div>
+          <canvas id="duel-bars-canvas" data-height="126" aria-label="세 예측기가 표적 분기를 맞힌 비율을 나타낸 가로 막대"></canvas>
+          <canvas id="duel-line-canvas" data-height="244" aria-label="실행 횟수에 따른 세 예측기의 최근 100회 정확도 꺾은선"></canvas>
+          <div class="strip-group">
+            <div class="legend"><span><i style="background:var(--taken)"></i>실제 taken</span><span><i style="background:var(--not-taken)"></i>실제 not-taken</span><span><i style="background:transparent; box-shadow: 0 0 0 2px var(--mispredict)"></i>✕ 그 예측기가 틀린 곳</span></div>
+            <div class="strip-caption"><i style="background:var(--series-1)"></i>bimodal이 본 마지막 28회</div>
+            <div id="duel-strip-bimodal"></div>
+            <div class="strip-caption"><i style="background:var(--series-2)"></i>gshare가 본 마지막 28회</div>
+            <div id="duel-strip-gshare"></div>
+            <div class="strip-caption"><i style="background:var(--series-3)"></i>TAGE가 본 마지막 28회</div>
+            <div id="duel-strip-tage"></div>
+          </div>
+        </div>
+        <div class="simulator-controls">
+          <div class="control"><span>분기 패턴</span><div class="segmented" id="duel-pattern"><button data-value="loop" class="on">루프</button><button data-value="alternating">번갈아</button><button data-value="correlated">앞 분기와 상관</button><button data-value="periodic">긴 주기</button><button data-value="data">값 의존</button></div></div>
+          <label class="control"><span>루프 반복 횟수 <output id="duel-trip-output"></output></span><input type="range" id="duel-trip" min="2" max="80" step="1" value="6"></label>
+        </div>
+      </div>
+      <div class="simulator-readout">
+        <div class="statistic"><span class="statistic-label">bimodal 정확도</span><span class="statistic-value" id="duel-bimodal">—</span></div>
+        <div class="statistic"><span class="statistic-label">gshare 정확도</span><span class="statistic-value" id="duel-gshare">—</span></div>
+        <div class="statistic"><span class="statistic-label">TAGE 정확도</span><span class="statistic-value" id="duel-tage">—</span></div>
+        <div class="statistic"><span class="statistic-label">표적 분기 실행</span><span class="statistic-value" id="duel-count">—</span></div>
+      </div>
+      <div class="simulator-note"><b>설명용 모델.</b> 이 책의 축소 예측기를 실제로 돌린 결과다. bimodal은 카운터 1,024개, gshare는 카운터 1,024개와 history 10 bit, TAGE는 base 표 1,024칸에 tag 표 5개(각 256칸, history 4·8·16·32·64 bit)다. 정확도는 표적 분기 하나만 센다. 실제 64KB 예측기와는 크기도 구성도 다르므로 숫자가 아니라 경향을 보자. <b>해 볼 것.</b> 루프 반복 횟수를 11에서 12로, 65에서 66으로 넘겨 보자.</div>
+    </div>
+    <p>다섯 패턴에서 볼 것은 다음과 같다.</p>
+    <ul>
+      <li><strong>번갈아</strong>: bimodal은 거의 다 틀리고, history를 쓰는 두 예측기는 금방 다 맞힌다. 1장의 숙제가 풀렸다.</li>
+      <li><strong>루프</strong>: bimodal은 빠져나올 때마다 한 번씩 틀린다. gshare는 반복 11회까지는 끝을 맞히다가 12회부터 무너지고, 이때는 bimodal보다도 낮아진다. TAGE는 65회까지 버티고 66회부터 끝을 놓친다.</li>
+      <li><strong>앞 분기와 상관</strong>: 표적 분기의 결과는 여섯 개 앞 분기의 결과와 같다. 표적 분기만 보는 bimodal에게는 동전 던지기지만, global history를 보는 예측기에게는 쉬운 분기다.</li>
+      <li><strong>긴 주기</strong>: 48개짜리 패턴이 반복된다. gshare의 10 bit로는 주기 안의 여러 자리가 똑같아 보여 구별하지 못한다.</li>
+      <li><strong>값 의존</strong>: 매번 새 데이터 값이 방향을 정한다(70%는 taken). 세 예측기 모두 70%를 넘지 못하고, history를 쓰는 쪽이 오히려 낮다. 과거 방향에 답이 없는데 거기서 규칙을 찾으려 하기 때문이다.</li>
+    </ul>
+    <p>루프 실험은 다음 절의 질문을 던진다. gshare는 왜 하필 12회에서, TAGE는 왜 66회에서 무너지는가.</p>
+  </section>
+
+  <!-- ============================================================ 3 -->
+  <section id="history-length">
+    <h2>history 길이는 하나로 부족하다</h2>
+    <p>반복 12회짜리 루프에서 끝을 맞히려면 "방금까지 taken이 열한 번 이어졌다"는 사실을 알아야 한다. history가 10 bit뿐이면 taken 열 번 뒤와 열한 번 뒤가 똑같이 보인다. 구별할 정보가 창 밖으로 밀려난 것이다. history가 \( L \) bit면 반복 \( L+1 \)회까지만 끝을 가려낼 수 있다. 가장 긴 history가 64 bit인 축소 TAGE가 66회에서 무너진 것도 같은 이유다.</p>
+    <p>그러면 history를 넉넉히 길게 잡으면 되지 않는가. 아래 실험이 그 대가를 보여 준다. 표적 분기의 결과는 정확히 \( d \)개 앞에 실행된 <strong>원인 분기</strong>의 결과와 같다. 그 사이에는 표적과 무관한 분기 \( d-1 \)개가 끼어 있다.</p>
+
+    <div class="simulator" id="simulator-length">
+      <div class="simulator-head"><span class="simulator-tag">실험 2</span><h3>history 길이가 맞아야 한다</h3></div>
+      <div class="simulator-body side">
+        <div class="simulator-view">
+          <canvas id="length-window-canvas" data-height="112" aria-label="표적 분기 앞의 분기 20개와 gshare가 보는 history 범위"></canvas>
+          <div class="legend"><span><i class="line" style="background:var(--series-2)"></i>gshare의 표적 분기 정확도</span><span><i style="background:var(--surface-strong)"></i>원인 분기가 history 밖에 있는 구간</span></div>
+          <canvas id="length-curve-canvas" data-height="280" aria-label="history 길이에 따른 gshare 정확도 곡선"></canvas>
+        </div>
+        <div class="simulator-controls">
+          <label class="control"><span>상관 거리 d <output id="length-distance-output"></output></span><input type="range" id="length-distance" min="1" max="16" step="1" value="8"></label>
+          <label class="control"><span>gshare history 길이 <output id="length-history-output"></output></span><input type="range" id="length-history" min="1" max="20" step="1" value="5"></label>
+          <div class="control"><span>사이에 낀 분기</span><div class="segmented" id="length-filler"><button data-value="steady">늘 같은 방향</button><button data-value="occasional" class="on">가끔 바뀜</button><button data-value="random">무작위</button></div></div>
+        </div>
+      </div>
+      <div class="simulator-readout">
+        <div class="statistic"><span class="statistic-label">현재 설정의 정확도</span><span class="statistic-value" id="length-accuracy">—</span></div>
+        <div class="statistic"><span class="statistic-label">원인 분기가 history 안에</span><span class="statistic-value" id="length-reach">—</span></div>
+        <div class="statistic"><span class="statistic-label">표적이 겪은 서로 다른 history</span><span class="statistic-value" id="length-distinct">—</span></div>
+        <div class="statistic"><span class="statistic-label">가장 정확한 길이</span><span class="statistic-value" id="length-best">—</span></div>
+      </div>
+      <div class="simulator-note"><b>설명용 모델.</b> 원인 분기는 반반 확률로 방향이 정해지고, 사이에 낀 분기는 고른 설정에 따라 100%, 90%, 50% 확률로 taken이다. gshare는 카운터 4,096개로 고정하고 history 길이만 1부터 20까지 바꿔 가며 1,100회 반복한 trace를 매번 처음부터 돌렸다. <b>해 볼 것.</b> history 길이를 거리보다 하나 짧게, 같게, 훨씬 길게 놓아 보자. 그다음 "사이에 낀 분기"를 바꿔 긴 history의 값이 어디서 나오는지 확인하자.</div>
+    </div>
+    <p>곡선에는 두 가지 모양이 겹쳐 있다.</p>
+    <p>첫째는 <strong>절벽</strong>이다. history 길이가 거리 \( d \)보다 짧으면 원인 분기가 창 안에 들어오지 않는다. 정확도는 50% 근처, 곧 동전 던지기다. 길이가 \( d \)에 닿는 순간 정확도가 뛰어오른다.</p>
+    <p>둘째는 <strong>내리막</strong>이다. 필요한 길이를 넘겨 더 길게 잡으면 정확도가 다시 떨어진다. 창 안에 들어온 무관한 분기들의 방향이 조금만 달라도 gshare에게는 다른 history이고, 다른 카운터다. 같은 규칙을 history마다 따로 배워야 하니 학습이 느려지고, 표의 칸은 모자라진다.</p>
+    <div class="formula">
+      $$ \text{구별해야 할 history 가짓수} \;\le\; 2^{L} $$
+      <div class="formula-note">\( L \)은 history 길이다. 창 안의 분기가 모두 제멋대로면 가짓수가 상한 \( 2^{L} \)에 가까워지고, 대부분 정해진 방향으로만 가면 훨씬 적다. 실험의 "표적이 겪은 서로 다른 history" 칸이 이 값을 실제로 센 것이다.</div>
+    </div>
+    <p>"사이에 낀 분기"를 <strong>늘 같은 방향</strong>으로 바꾸면 내리막이 대부분 사라진다. 창이 길어져도 새로 생기는 history가 얼마 없기 때문이다. 그래도 남는 굴곡은 두 가지에서 온다. 창이 아주 길어지면 이전 회차의 원인 분기들이 들어오고, 서로 다른 분기가 같은 카운터에 떨어지는 aliasing도 생긴다.</p>
+    <p><strong>무작위</strong>로 바꾸면 길이를 딱 맞춰도 정확도가 낮다. 거리 8에서는 가장 좋은 길이에서도 80% 안팎이고, 거리 12부터는 어떤 길이로도 동전 던지기를 거의 벗어나지 못한다. 필요한 신호는 history 안에 분명히 있는데, 주변의 noise가 그 신호를 수많은 조각으로 쪼개 버린 것이다. 이 현상은 <a href="correlation.html">4장</a>의 출발점이다.</p>
+    <div class="callout">
+      <strong>길이를 하나만 고를 수는 없다</strong>
+      <p>짧은 history는 빨리 배우고 표를 아끼지만 먼 상관을 보지 못한다. 긴 history는 먼 상관을 보지만 느리게 배우고 표를 많이 쓴다. 게다가 프로그램 안의 분기마다 필요한 길이가 다르다. 그래서 "모든 분기에 맞는 길이 하나"는 없다.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ 4 -->
+  <section id="tage">
+    <h2>TAGE: 여러 길이를 한꺼번에 쓴다</h2>
+    <p><span class="term">TAGE</span><span class="english">(TAgged GEometric history length)</span>의 답은 "고르지 말고 전부 준비해 두자"다. history 길이가 서로 다른 표를 여러 개 두고, 분기마다 그때그때 가장 알맞은 표의 답을 쓴다.</p>
+    <p>표의 history 길이는 일정한 비율로 늘어난다. 짧은 쪽은 촘촘하게, 긴 쪽은 듬성듬성하게 덮기 위해서다.</p>
+    <div class="formula">
+      $$ L_i \approx L_1 \times \alpha^{\,i-1} \qquad (i = 1, 2, \dots) $$
+      <div class="formula-note">\( L_i \)는 \( i \)번째 tag 표가 보는 history 길이, \( \alpha \)는 1보다 큰 비율이다. 이 책의 축소 모델은 \( L_1 = 4,\ \alpha = 2 \)로 4, 8, 16, 32, 64를 쓴다. 이름의 "geometric"이 이 등비수열을 가리킨다.</div>
+    </div>
+    <figure class="diagram">
+      <svg viewBox="0 0 880 384" role="img" aria-label="TAGE의 구조: base 표와 history 길이가 다른 tag 표 다섯 개, 그리고 가장 긴 history로 일치한 표를 고르는 선택기">
+        <defs>
+          <marker id="tage-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrow-head"/></marker>
+          <marker id="tage-arrow-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrow-head-accent"/></marker>
+        </defs>
+        <rect x="20" y="16" width="120" height="44" rx="9" class="fill-accent-soft"/><text x="80" y="43" text-anchor="middle" class="label-strong">분기 주소 PC</text>
+        <rect x="162" y="16" width="688" height="44" rx="9" class="fill-surface"/><text x="506" y="43" text-anchor="middle" class="label">global history: 표마다 최근 것부터 서로 다른 길이만큼 본다</text>
+        <path d="M80 60 V118" class="stroke-line" marker-end="url(#tage-arrow)"/>
+        <path d="M80 78 H790" class="stroke-line"/>
+        <path d="M222 60 V78 M364 60 V78 M506 60 V78 M648 60 V78 M790 60 V78" class="stroke-line"/>
+        <path d="M222 78 V92 M364 78 V92 M506 78 V92 M648 78 V92 M790 78 V92" class="stroke-line"/>
+        <rect x="214" y="98" width="16" height="9" rx="3" class="fill-accent"/>
+        <rect x="350" y="98" width="28" height="9" rx="3" class="fill-accent"/>
+        <rect x="482" y="98" width="48" height="9" rx="3" class="fill-accent"/>
+        <rect x="610" y="98" width="76" height="9" rx="3" class="fill-accent"/>
+        <rect x="734" y="98" width="112" height="9" rx="3" class="fill-accent"/>
+        <g>
+          <rect x="20" y="124" width="120" height="92" rx="10" class="fill-surface"/>
+          <text x="80" y="150" text-anchor="middle" class="label-strong">base 표</text>
+          <text x="80" y="172" text-anchor="middle" class="label-dim">주소만 본다</text>
+          <text x="80" y="196" text-anchor="middle" class="label-mono">2-bit 카운터</text>
+          <rect x="162" y="124" width="120" height="92" rx="10" class="fill-surface"/>
+          <text x="222" y="150" text-anchor="middle" class="label-strong">표 1</text>
+          <text x="222" y="172" text-anchor="middle" class="label-dim">history 4</text>
+          <text x="222" y="196" text-anchor="middle" class="label-mono">tag·카운터·u</text>
+          <rect x="304" y="124" width="120" height="92" rx="10" class="fill-surface"/>
+          <text x="364" y="150" text-anchor="middle" class="label-strong">표 2</text>
+          <text x="364" y="172" text-anchor="middle" class="label-dim">history 8</text>
+          <text x="364" y="196" text-anchor="middle" class="label-mono">tag·카운터·u</text>
+          <rect x="446" y="124" width="120" height="92" rx="10" class="fill-accent-soft"/>
+          <text x="506" y="150" text-anchor="middle" class="label-strong">표 3</text>
+          <text x="506" y="172" text-anchor="middle" class="label-dim">history 16</text>
+          <text x="506" y="196" text-anchor="middle" class="label-mono">tag·카운터·u</text>
+          <rect x="588" y="124" width="120" height="92" rx="10" class="fill-surface"/>
+          <text x="648" y="150" text-anchor="middle" class="label-strong">표 4</text>
+          <text x="648" y="172" text-anchor="middle" class="label-dim">history 32</text>
+          <text x="648" y="196" text-anchor="middle" class="label-mono">tag·카운터·u</text>
+          <rect x="730" y="124" width="120" height="92" rx="10" class="fill-surface"/>
+          <text x="790" y="150" text-anchor="middle" class="label-strong">표 5</text>
+          <text x="790" y="172" text-anchor="middle" class="label-dim">history 64</text>
+          <text x="790" y="196" text-anchor="middle" class="label-mono">tag·카운터·u</text>
+        </g>
+        <g>
+          <rect x="32" y="232" width="96" height="28" rx="14" class="fill-elevated"/><text x="80" y="251" text-anchor="middle" class="label-dim">늘 답한다</text>
+          <rect x="174" y="232" width="96" height="28" rx="14" class="fill-accent-soft"/><text x="222" y="251" text-anchor="middle" class="label-accent">tag 일치</text>
+          <rect x="316" y="232" width="96" height="28" rx="14" class="fill-elevated"/><text x="364" y="251" text-anchor="middle" class="label-dim">불일치</text>
+          <rect x="458" y="232" width="96" height="28" rx="14" class="fill-accent-soft"/><text x="506" y="251" text-anchor="middle" class="label-accent">tag 일치</text>
+          <rect x="600" y="232" width="96" height="28" rx="14" class="fill-elevated"/><text x="648" y="251" text-anchor="middle" class="label-dim">불일치</text>
+          <rect x="742" y="232" width="96" height="28" rx="14" class="fill-elevated"/><text x="790" y="251" text-anchor="middle" class="label-dim">불일치</text>
+        </g>
+        <text x="222" y="282" text-anchor="middle" class="label-dim">대안 (alternate)</text>
+        <text x="506" y="282" text-anchor="middle" class="label-accent">provider</text>
+        <path d="M506 290 V312" class="stroke-accent" marker-end="url(#tage-arrow-accent)"/>
+        <rect x="20" y="318" width="640" height="46" rx="10" class="fill-surface"/>
+        <text x="340" y="346" text-anchor="middle" class="label">일치한 표 가운데 history가 가장 긴 표 3의 카운터가 방향을 정한다</text>
+        <path d="M664 341 H702" class="stroke-line" marker-end="url(#tage-arrow)"/>
+        <rect x="708" y="318" width="142" height="46" rx="10" class="fill-accent-soft"/>
+        <text x="779" y="346" text-anchor="middle" class="label-strong">예측 방향</text>
+      </svg>
+      <figcaption><b>그림 2-3.</b> TAGE의 예측 과정. 보라색 막대의 길이는 각 표가 보는 history 길이를 나타낸다(이 책의 축소 모델 값). 표 1과 표 3에서 tag가 일치했고, 더 긴 history를 쓰는 표 3이 provider가 된다.</figcaption>
+    </figure>
+    <h3>예측할 때</h3>
+    <ol>
+      <li>모든 표를 동시에 찾는다. 표마다 PC와 자기 길이만큼의 history를 hash해서 색인과 <span class="term">tag</span>를 만든다.</li>
+      <li>찾아간 칸에 적힌 tag가 방금 만든 tag와 같으면 <strong>일치</strong>다. tag는 "이 칸이 정말 이 분기, 이 history를 위해 만든 칸인가"를 확인하는 짧은 지문이다. gshare에는 이 확인이 없어서 남의 카운터를 자기 것처럼 쓰는 일이 생겼다.</li>
+      <li>일치한 표 가운데 history가 가장 긴 표가 <span class="term">provider</span>가 되어 방향을 정한다. 그다음으로 긴 일치 표(없으면 base 표)는 <span class="term">대안</span><span class="english">(alternate)</span>으로 남는다.</li>
+      <li>어느 tag 표도 일치하지 않으면 base 표의 2-bit 카운터가 답한다.</li>
+    </ol>
+    <p>가장 긴 일치를 믿는 이유는, 더 긴 history로 일치했다는 것이 더 구체적인 상황을 알아봤다는 뜻이기 때문이다. "taken이 네 번 이어졌다"보다 "taken이 서른한 번 이어졌다"가 루프의 끝을 더 정확히 가리킨다.</p>
+    <h3>배울 때</h3>
+    <p>실제 방향이 나오면 provider의 카운터를 그쪽으로 한 칸 옮긴다. 여기까지는 1장과 같다. TAGE다운 부분은 <strong>틀렸을 때</strong>다.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 214" role="img" aria-label="오예측 뒤 TAGE가 더 긴 history 표에 새 entry를 할당하는 순서">
+        <defs><marker id="allocation-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrow-head"/></marker></defs>
+        <rect x="20" y="24" width="250" height="84" rx="10" class="fill-mispredict-soft"/>
+        <text x="145" y="52" text-anchor="middle" class="label-strong">① ✕ provider가 틀렸다</text>
+        <text x="145" y="74" text-anchor="middle" class="label-dim">표 3 (history 16)의 답이</text>
+        <text x="145" y="92" text-anchor="middle" class="label-dim">실제 방향과 달랐다</text>
+        <path d="M274 66 H300" class="stroke-line" marker-end="url(#allocation-arrow)"/>
+        <rect x="305" y="24" width="250" height="84" rx="10" class="fill-surface"/>
+        <text x="430" y="52" text-anchor="middle" class="label-strong">② 더 긴 표에서 빈자리 찾기</text>
+        <text x="430" y="74" text-anchor="middle" class="label-dim">표 4, 표 5의 해당 칸 가운데</text>
+        <text x="430" y="92" text-anchor="middle" class="label-dim">useful이 0인 첫 칸</text>
+        <path d="M559 66 H585" class="stroke-line" marker-end="url(#allocation-arrow)"/>
+        <rect x="590" y="24" width="250" height="84" rx="10" class="fill-accent-soft"/>
+        <text x="715" y="52" text-anchor="middle" class="label-strong">③ 새 entry 할당</text>
+        <text x="715" y="74" text-anchor="middle" class="label-dim">새 tag를 적고 카운터는</text>
+        <text x="715" y="92" text-anchor="middle" class="label-dim">실제 방향 쪽 "약함"으로 시작</text>
+        <path d="M430 108 V136" class="stroke-dashed" marker-end="url(#allocation-arrow)"/>
+        <rect x="170" y="142" width="520" height="52" rx="10" class="fill-elevated"/>
+        <text x="430" y="164" text-anchor="middle" class="label">빈자리가 없으면 할당을 포기한다</text>
+        <text x="430" y="183" text-anchor="middle" class="label-dim">대신 살펴본 칸의 useful을 1씩 낮춰 다음 기회를 만든다</text>
+      </svg>
+      <figcaption><b>그림 2-4.</b> 오예측 뒤의 할당. 지금 쓴 history로 틀렸으니 더 긴 history라면 구별할 수 있을지 모른다는 가정이다. 한 번의 오예측에 entry 하나만 만든다(이 책의 축소 모델 기준).</figcaption>
+    </figure>
+    <p>새 entry를 만들려면 누군가의 칸을 빼앗아야 한다. 누구의 칸을 지켜 줄지는 entry마다 붙은 작은 카운터 <span class="term">useful</span>이 정한다. provider는 맞고 대안은 틀렸다면, 이 entry가 없었으면 틀렸을 것이다. 그때 useful을 올린다. 둘이 같은 답을 냈다면 굳이 긴 history가 필요 없었다는 뜻이니 올리지 않는다. useful은 주기적으로 깎아서, 예전에만 쓸모 있던 entry가 자리를 영영 차지하지 못하게 한다.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>entry의 칸</th><th>하는 일</th><th>언제 바뀌는가</th></tr></thead>
+      <tbody>
+        <tr><td><strong>tag</strong></td><td>이 칸이 지금의 (PC, history)를 위한 칸인지 확인한다.</td><td>새 entry를 할당할 때 덮어쓴다.</td></tr>
+        <tr><td><strong>예측 카운터</strong></td><td>방향과 그 확신의 세기를 담는다.</td><td>이 entry가 provider였던 분기의 결과가 나올 때마다.</td></tr>
+        <tr><td><strong>useful</strong></td><td>이 entry를 지킬지, 내줄지 정한다.</td><td>provider와 대안의 답이 달랐을 때 오르내리고, 주기적으로 깎인다.</td></tr>
+      </tbody>
+    </table></div>
+    <p>정리하면 TAGE는 쉬운 분기를 짧은 표와 base 표에 두고, 틀릴 때마다 더 긴 history 쪽으로 한 단계씩 올려 보낸다. 분기마다 필요한 길이를 예측기가 스스로 찾아가는 셈이다. 아래 실험에서 그 결과를 들여다보자.</p>
+
+    <div class="simulator" id="simulator-inside">
+      <div class="simulator-head"><span class="simulator-tag">실험 3</span><h3>TAGE 안을 들여다보기</h3></div>
+      <div class="simulator-body side">
+        <div class="simulator-view">
+          <div class="legend"><span><i style="background:var(--series-3)"></i>그 표가 provider였던 예측의 비율</span><span><i style="background:var(--mispredict)"></i>✕ 그 가운데 틀린 횟수</span></div>
+          <canvas id="inside-provider-canvas" data-height="270" aria-label="예측을 제공한 표를 history 길이별로 센 막대 그래프"></canvas>
+          <div class="legend" style="padding-top: 10px"><span><i style="background:var(--series-3)"></i>tag 표마다 채워진 칸</span></div>
+          <canvas id="inside-occupancy-canvas" data-height="164" aria-label="tag 표 다섯 개의 점유율 가로 막대"></canvas>
+        </div>
+        <div class="simulator-controls">
+          <label class="control"><span>tag 표 하나의 크기 <output id="inside-size-output"></output></span><input type="range" id="inside-size" min="2" max="10" step="1" value="8"></label>
+        </div>
+      </div>
+      <div class="simulator-readout">
+        <div class="statistic"><span class="statistic-label">정확도</span><span class="statistic-value" id="inside-accuracy">—</span></div>
+        <div class="statistic"><span class="statistic-label">가장 큰 표(1,024칸) 대비</span><span class="statistic-value" id="inside-difference">—</span></div>
+        <div class="statistic"><span class="statistic-label">새 entry 할당</span><span class="statistic-value" id="inside-allocations">—</span></div>
+        <div class="statistic"><span class="statistic-label">채워진 칸</span><span class="statistic-value" id="inside-occupancy">—</span></div>
+      </div>
+      <div class="simulator-note"><b>설명용 모델.</b> 정적 분기 39개가 섞인 16,000개짜리 trace를 축소 TAGE(tag 표 5개, tag 9 bit)에 넣었다. trace에는 늘 같은 방향인 분기, 반복 3회부터 52회까지의 루프와 그 안의 분기, 거리 3부터 18까지의 상관 분기, 값에 따라 정해지는 분기 2개가 들어 있다. <b>해 볼 것.</b> 표 크기를 256칸에서 4칸까지 줄여 보자. 긴 history 표가 맡던 예측이 base 표로 밀려나고 정확도가 떨어진다.</div>
+    </div>
+    <p>표가 넉넉할 때는 예측이 여러 길이에 고르게 나뉜다. 늘 같은 방향인 분기는 base 표가, 짧은 루프는 짧은 history 표가, 긴 루프와 먼 상관은 긴 history 표가 맡는다. 아무도 길이를 지정하지 않았는데 일이 나뉜 것이다.</p>
+    <p>표를 줄이면 두 가지가 보인다. 채워진 칸이 금세 표 크기에 닿고, 할당 횟수가 크게 는다. 기껏 배운 entry가 다른 분기에게 밀려나고, 밀려난 분기는 다시 틀린 뒤 다시 할당받는 일이 되풀이되기 때문이다. 배울 수 있는 패턴인데 둘 곳이 없어서 틀리는 것이다.</p>
+    <div class="callout evidence">
+      <strong>실제 TAGE의 규모</strong>
+      <p>LLBP 논문(MICRO 2024)의 배경 설명에 따르면, 고성능 프로세서의 대표적인 구성은 표를 최대 30개, 저장 공간을 64KiB 쓰고, 가장 긴 history는 최대 3,000 bit에 이른다. entry는 tag, 부호 있는 예측 카운터, useful bit로 이루어진다. 이 책의 축소 모델은 표 5개에 history 64 bit까지만 쓴다.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ 5 -->
+  <section id="tage-sc-l">
+    <h2>TAGE-SC-L과 64KB라는 기준선</h2>
+    <p>이 책의 논문들이 비교 대상으로 삼는 예측기는 TAGE에 보조 장치 둘을 더한 <span class="term">TAGE-SC-L</span>이다. 이름의 뒤쪽 두 글자가 그 장치다.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>구성 요소</th><th>하는 일</th><th>이 책의 축소 모델</th></tr></thead>
+      <tbody>
+        <tr><td><strong>TAGE</strong></td><td>여러 길이의 global history로 패턴을 찾는 본체.</td><td>있음 (표 5개)</td></tr>
+        <tr><td><strong>SC</strong> (statistical corrector)</td><td>TAGE의 답이 통계적으로 자주 틀리는 경우를 찾아 방향을 뒤집는다. 한쪽으로 치우쳤을 뿐 history와 뚜렷한 상관이 없는 분기에서 TAGE가 헛짚는 것을 바로잡는다.</td><td>없음</td></tr>
+        <tr><td><strong>L</strong> (loop predictor)</td><td>반복 횟수가 일정한 루프를 알아보고, 횟수를 세어 빠져나오는 순간을 맞힌다.</td><td>없음</td></tr>
+      </tbody>
+    </table></div>
+    <p>실험 1에서 두 장치가 왜 필요한지 이미 보았다. "값 의존" 패턴에서 TAGE는 단순한 bimodal보다 낮았다. 70% taken이라는 치우침만 따르면 될 것을, 있지도 않은 패턴을 찾느라 entry를 계속 갈아 치웠기 때문이다. SC는 이런 경우에 통계적인 치우침 쪽으로 답을 되돌린다. 또 반복 66회 이상의 루프에서 TAGE는 끝을 놓쳤다. loop predictor는 history 길이와 상관없이 횟수를 세므로 이런 루프를 맡을 수 있다.</p>
+    <div class="callout evidence">
+      <strong>논문이 쓰는 기준선</strong>
+      <p>LLBP 논문(MICRO 2024)은 64KiB TAGE-SC-L의 두 보조 장치를 "어렵거나 통계적으로 치우친 분기를 위한 statistical corrector"와 "루프의 끝을 예측하는 loop predictor"로 설명한다. Branch Runahead 논문(MICRO 2021)은 64KB TAGE-SC-L을 2016년 Championship Branch Prediction의 제한 저장 공간 부문 우승작으로 소개한다. BranchNet, Branch Runahead, TEA, Whisper, LLBP, LLBP-X, Phelps, Alternate Path Fetch가 모두 64KB TAGE-SC-L을 baseline 예측기로 쓴다. RUNLTS는 192KB 기준이며 조건은 <a href="value.html">5장</a>에서 따로 적는다.</p>
+    </div>
+    <p>그래서 이 책에서 "baseline 대비 MPKI 몇 % 감소"라는 문장을 만나면, 대개 그 baseline은 64KB TAGE-SC-L이다. 이미 매우 잘 맞히는 예측기를 기준으로 삼았다는 뜻이다. 거기서 남은 오예측은 표를 조금 키우거나 history를 조금 늘려서는 줄지 않는 것들이다. LLBP 논문은 자신이 조사한 서버 workload에서 TAGE 용량을 64KB에서 128KB로 두 배 늘려도 MPKI가 6.4%만 줄었다고 보고한다.</p>
+  </section>
+
+  <!-- ============================================================ 6 -->
+  <section id="limits">
+    <h2>history만으로는 넘지 못하는 세 가지 벽</h2>
+    <p>이 장의 세 실험은 저마다 TAGE가 실패하는 조건을 하나씩 보여 주었다. 실패의 이유가 서로 다르다는 점이 중요하다. 이유가 다르면 해법도 다르기 때문이다.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 236" role="img" aria-label="history 기반 예측의 세 가지 한계: 정보, 표현, 상태">
+        <rect x="20" y="20" width="262" height="176" rx="12" class="fill-surface"/>
+        <rect x="20" y="20" width="262" height="44" rx="12" class="fill-accent-soft"/>
+        <text x="151" y="48" text-anchor="middle" class="label-strong">정보의 벽</text>
+        <text x="151" y="92" text-anchor="middle" class="label">답이 history 안에 없다</text>
+        <text x="151" y="122" text-anchor="middle" class="label-dim">예: 처음 보는 데이터 값을</text>
+        <text x="151" y="140" text-anchor="middle" class="label-dim">비교하는 분기</text>
+        <text x="151" y="176" text-anchor="middle" class="label-accent">실험 1의 "값 의존"</text>
+        <rect x="299" y="20" width="262" height="176" rx="12" class="fill-surface"/>
+        <rect x="299" y="20" width="262" height="44" rx="12" class="fill-accent-soft"/>
+        <text x="430" y="48" text-anchor="middle" class="label-strong">표현의 벽</text>
+        <text x="430" y="92" text-anchor="middle" class="label">신호는 있는데 noise에 묻혔다</text>
+        <text x="430" y="122" text-anchor="middle" class="label-dim">예: 사이에 제멋대로인 분기가</text>
+        <text x="430" y="140" text-anchor="middle" class="label-dim">끼어 있는 먼 상관</text>
+        <text x="430" y="176" text-anchor="middle" class="label-accent">실험 2의 "무작위"</text>
+        <rect x="578" y="20" width="262" height="176" rx="12" class="fill-surface"/>
+        <rect x="578" y="20" width="262" height="44" rx="12" class="fill-accent-soft"/>
+        <text x="709" y="48" text-anchor="middle" class="label-strong">상태의 벽</text>
+        <text x="709" y="92" text-anchor="middle" class="label">기억할 패턴이 너무 많다</text>
+        <text x="709" y="122" text-anchor="middle" class="label-dim">예: 코드가 매우 큰</text>
+        <text x="709" y="140" text-anchor="middle" class="label-dim">서버 프로그램</text>
+        <text x="709" y="176" text-anchor="middle" class="label-accent">실험 3의 "작은 표"</text>
+        <text x="430" y="224" text-anchor="middle" class="label-dim">한 분기가 두 가지 벽에 함께 걸릴 수도 있다.</text>
+      </svg>
+      <figcaption><b>그림 2-5.</b> history 기반 예측이 막히는 세 가지 이유. 이 책의 뒤쪽 장들은 이 벽 가운데 하나씩을 겨냥한다.</figcaption>
+    </figure>
+    <ul>
+      <li><strong>정보의 벽.</strong> 방향을 정하는 것이 방금 메모리에서 읽은 값이라면, 과거 방향을 아무리 길게 보아도 답이 없다. 예측기를 키워도 소용없다. 필요한 것은 다른 종류의 정보다. 값을 직접 보거나, 필요한 계산을 미리 해 보는 방법이 <a href="value.html">5장</a>과 <a href="loop.html">7장</a>에 나온다.</li>
+      <li><strong>표현의 벽.</strong> 답을 알려 주는 분기가 history 안에 있기는 하다. 다만 멀리 있고, 그 사이에 무관한 분기가 제멋대로 끼어든다. TAGE는 history를 통째로 hash하기 때문에 한 bit만 달라도 다른 패턴으로 본다. 필요한 신호만 골라 보는 표현이 <a href="correlation.html">4장</a>의 주제다.</li>
+      <li><strong>상태의 벽.</strong> 배울 수 있는 패턴인데 수가 너무 많아 표에 다 들어가지 않는다. 패턴을 더 짧게 적거나, 더 큰 저장소에 두었다가 필요할 때 가져오거나, 쓸모없는 패턴이 자리를 차지하지 못하게 막는 방법이 <a href="state.html">6장</a>에 나온다.</li>
+    </ul>
+    <p>벽을 넘는 것 말고 다른 길도 있다. 틀린 뒤의 손실을 줄이는 방법(<a href="recovery.html">8장</a>), 크고 정확한 예측기의 답이 늦게 나오는 문제를 푸는 방법(<a href="latency.html">9장</a>)이다.</p>
+    <p>그 전에 한 가지를 분명히 해야 한다. 지금까지 "어려운 분기"라는 말을 느슨하게 썼다. 어떤 분기를 어렵다고 부르는가, 그런 분기는 얼마나 많은가. <a href="h2p.html">3장</a>에서 이 질문을 다룬다.</p>
+  </section>
+
+  <section id="summary" class="keypoints">
+    <h2>핵심 정리</h2>
+    <ol>
+      <li>history는 앞서 실행한 분기의 방향이나 경로를 적은 기록이다. 예측기는 PC와 history를 함께 써서, 직전 상황마다 다른 카운터로 방향을 배운다.</li>
+      <li>gshare는 PC와 global history를 XOR해 카운터 표의 칸을 고른다. 번갈아 나오는 분기와 다른 분기와의 상관을 맞히지만, history 길이를 하나로 고정해야 한다.</li>
+      <li>history가 필요한 것보다 짧으면 원인이 창 밖에 있어 맞힐 수 없고, 길면 구별해야 할 history가 늘어 학습이 느려지고 표가 모자라진다.</li>
+      <li>TAGE는 history 길이가 등비로 늘어나는 tag 표 여러 개를 두고, tag가 일치한 표 가운데 가장 긴 것(provider)의 답을 쓴다. 틀리면 더 긴 표에 새 entry를 할당하고, useful로 지킬 entry를 가린다.</li>
+      <li>이 책의 논문 대부분은 TAGE에 statistical corrector와 loop predictor를 더한 64KB TAGE-SC-L을 baseline으로 쓴다.</li>
+      <li>history 기반 예측은 세 가지 이유로 막힌다. 답이 history에 없거나(정보), noise에 묻혔거나(표현), 패턴이 너무 많다(상태).</li>
+    </ol>
+  </section>
+
+  <section id="quiz">
+    <h2>확인 퀴즈</h2>
+    <div class="quiz" id="chapter-quiz"></div>
+  </section>
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  // 같은 예측기는 이 장의 모든 차트에서 같은 색을 쓴다. 색으로 예측기를 알아보게 하기 위해서다.
+  const PREDICTOR_SERIES_INDEX = { bimodal: 0, gshare: 1, tage: 2 };
+  const PREDICTOR_LABELS = { bimodal: "bimodal", gshare: "gshare", tage: "TAGE" };
+  const PERCENT_SCALE = 100;
+  const TEXT_ON_COLOR = "#ffffff";
+
+  /* ============================================================ 실험 1: 예측기 대결 */
+  (function setupDuelExperiment() {
+    const PREDICTOR_NAMES = ["bimodal", "gshare", "tage"];
+    const TARGET_ADDRESS = 0x40;
+    const SOURCE_ADDRESS = 0x80;
+    const FILLER_BASE_ADDRESS = 0x100;
+    const ADDRESS_STEP = 4;
+    const TARGET_EXECUTION_COUNT = 2400;
+    const CORRELATION_DISTANCE = 6;
+    const PERIODIC_PATTERN_LENGTH = 48;
+    const PERIODIC_TAKEN_PROBABILITY = 0.8;
+    const DATA_TAKEN_PROBABILITY = 0.7;
+    const EVEN_PROBABILITY = 0.5;
+    const TRACE_SEED = 7;
+    const PATTERN_SEED = 3;
+    const TABLE_INDEX_BITS = 10;
+    const GSHARE_HISTORY_LENGTH = 10;
+    const RUNNING_WINDOW_LENGTH = 100;
+    const RUNNING_SAMPLE_STEP = 20;
+    const STRIP_CELL_COUNT = 28;
+    const PATTERN_DESCRIPTIONS = {
+      loop: (tripCount) => "루프 분기: " + tripCount + "번에 한 번, 빠져나올 때만 not-taken이다.",
+      alternating: () => "번갈아: taken과 not-taken이 한 번씩 교대로 나온다.",
+      correlated: () => "앞 분기와 상관: 표적 분기의 방향은 " + CORRELATION_DISTANCE + "개 앞에서 실행된 분기의 방향과 같다. 그 분기의 방향은 반반 확률로 정해진다.",
+      periodic: () => "긴 주기: " + PERIODIC_PATTERN_LENGTH + "개짜리 방향 패턴이 그대로 되풀이된다.",
+      data: () => "값 의존: 매번 새 데이터 값이 방향을 정한다. " + DATA_TAKEN_PROBABILITY * PERCENT_SCALE + "%는 taken이지만 순서에는 규칙이 없다.",
+    };
+
+    function createPredictor(predictorName) {
+      if (predictorName === "bimodal") return BranchBook.predictors.createBimodal({ indexBits: TABLE_INDEX_BITS });
+      if (predictorName === "gshare") return BranchBook.predictors.createGshare({ indexBits: TABLE_INDEX_BITS, historyLength: GSHARE_HISTORY_LENGTH });
+      return BranchBook.predictors.createTage();
+    }
+
+    function buildTrace(patternName, tripCount) {
+      const random = BranchBook.createRandom(TRACE_SEED);
+      const patternRandom = BranchBook.createRandom(PATTERN_SEED);
+      const periodicPattern = Array.from({ length: PERIODIC_PATTERN_LENGTH }, () => patternRandom() < PERIODIC_TAKEN_PROBABILITY);
+      const trace = [];
+      function addTarget(isTaken) { trace.push({ address: TARGET_ADDRESS, taken: isTaken }); }
+      for (let executionIndex = 0; executionIndex < TARGET_EXECUTION_COUNT; executionIndex++) {
+        if (patternName === "loop") addTarget(executionIndex % tripCount !== tripCount - 1);
+        if (patternName === "alternating") addTarget(executionIndex % 2 === 0);
+        if (patternName === "periodic") addTarget(periodicPattern[executionIndex % PERIODIC_PATTERN_LENGTH]);
+        if (patternName === "data") addTarget(random() < DATA_TAKEN_PROBABILITY);
+        if (patternName === "correlated") {
+          const isSourceTaken = random() < EVEN_PROBABILITY;
+          trace.push({ address: SOURCE_ADDRESS, taken: isSourceTaken });
+          // 사이를 채우는 분기는 늘 taken이다. 표적 분기가 볼 history에 noise를 넣지 않기 위해서다.
+          for (let fillerIndex = 0; fillerIndex < CORRELATION_DISTANCE - 1; fillerIndex++) {
+            trace.push({ address: FILLER_BASE_ADDRESS + fillerIndex * ADDRESS_STEP, taken: true });
+          }
+          addTarget(isSourceTaken);
+        }
+      }
+      return trace;
+    }
+
+    /** 한 예측기를 trace에 돌려, 표적 분기만 골라 전체 정확도와 시간에 따른 정확도를 구한다. */
+    function evaluatePredictor(predictorName, trace) {
+      const result = BranchBook.runPredictor(createPredictor(predictorName), trace);
+      const targetCorrectness = [];
+      const targetOutcomes = [];
+      trace.forEach((branch, branchIndex) => {
+        if (branch.address !== TARGET_ADDRESS) return;
+        targetCorrectness.push(result.isCorrectList[branchIndex]);
+        targetOutcomes.push(branch.taken);
+      });
+      const runningPoints = [];
+      let windowCorrectCount = 0;
+      let totalCorrectCount = 0;
+      targetCorrectness.forEach((correctness, executionIndex) => {
+        windowCorrectCount += correctness;
+        totalCorrectCount += correctness;
+        if (executionIndex >= RUNNING_WINDOW_LENGTH) windowCorrectCount -= targetCorrectness[executionIndex - RUNNING_WINDOW_LENGTH];
+        const windowLength = Math.min(executionIndex + 1, RUNNING_WINDOW_LENGTH);
+        const executionNumber = executionIndex + 1;
+        if (executionNumber % RUNNING_SAMPLE_STEP === 0) runningPoints.push([executionNumber, (windowCorrectCount / windowLength) * PERCENT_SCALE]);
+      });
+      const stripOutcomes = targetOutcomes.slice(-STRIP_CELL_COUNT).map((taken, cellIndex) => {
+        const executionIndex = targetOutcomes.length - STRIP_CELL_COUNT + cellIndex;
+        return { taken, isMispredicted: targetCorrectness[executionIndex] === 0 };
+      });
+      return { predictorName, accuracy: totalCorrectCount / targetCorrectness.length, runningPoints, stripOutcomes };
+    }
+
+    let evaluations = [];
+    let barRegions = [];
+    let lineChart = null;
+
+    function refresh() {
+      const patternName = patternControl.value;
+      const isLoopPattern = patternName === "loop";
+      tripControl.input.disabled = !isLoopPattern;
+      document.getElementById("duel-trip-output").textContent = isLoopPattern ? tripControl.value + "회" : "루프에서만 쓴다";
+      const trace = buildTrace(patternName, tripControl.value);
+      evaluations = PREDICTOR_NAMES.map((predictorName) => evaluatePredictor(predictorName, trace));
+      evaluations.forEach((evaluation) => {
+        BranchBook.setContent("duel-" + evaluation.predictorName, BranchBook.formatPercent(evaluation.accuracy));
+        BranchBook.renderOutcomeStrip("duel-strip-" + evaluation.predictorName, evaluation.stripOutcomes, { isSmall: true });
+      });
+      BranchBook.setContent("duel-count", TARGET_EXECUTION_COUNT.toLocaleString("en-US") + "<small>회</small>");
+      BranchBook.setContent("duel-description", PATTERN_DESCRIPTIONS[patternName](tripControl.value));
+      barsCanvas.redraw();
+      lineCanvas.redraw();
+    }
+
+    const patternControl = BranchBook.bindSegmented("duel-pattern", refresh);
+    const tripControl = BranchBook.bindRange("duel-trip", (value) => value + "회", refresh);
+
+    const barsCanvas = BranchBook.createCanvas("duel-bars-canvas", (context, width, height, palette) => {
+      const labelWidth = 62;
+      const valueWidth = 58;
+      const barHeight = 22;
+      const rowGap = 12;
+      const chartLeft = labelWidth + 10;
+      const chartWidth = width - chartLeft - valueWidth - 6;
+      const top = 6;
+      barRegions = [];
+      context.textBaseline = "middle";
+      evaluations.forEach((evaluation, rowIndex) => {
+        const y = top + rowIndex * (barHeight + rowGap);
+        context.fillStyle = palette.surface;
+        BranchBook.roundedRectangle(context, chartLeft, y, chartWidth, barHeight, 4);
+        context.fill();
+        context.fillStyle = palette.series[PREDICTOR_SERIES_INDEX[evaluation.predictorName]];
+        BranchBook.roundedRectangle(context, chartLeft, y, Math.max(4, chartWidth * evaluation.accuracy), barHeight, 4);
+        context.fill();
+        context.fillStyle = palette.text;
+        context.font = "13px " + palette.font;
+        context.textAlign = "right";
+        context.fillText(PREDICTOR_LABELS[evaluation.predictorName], labelWidth, y + barHeight / 2);
+        context.font = "600 13px " + palette.mono;
+        context.textAlign = "left";
+        context.fillText(BranchBook.formatPercent(evaluation.accuracy), chartLeft + chartWidth + 8, y + barHeight / 2);
+        barRegions.push({ x: chartLeft, y, width: chartWidth, height: barHeight, evaluation });
+      });
+      context.fillStyle = palette.textDim;
+      context.font = "12px " + palette.font;
+      context.textAlign = "left";
+      context.fillText("표적 분기를 맞힌 비율 (학습 구간 포함)", chartLeft, top + evaluations.length * (barHeight + rowGap) + 4);
+    });
+    BranchBook.attachTooltip("duel-bars-canvas", (x, y) => {
+      const region = barRegions.find((candidate) => y >= candidate.y && y <= candidate.y + candidate.height && x >= candidate.x && x <= candidate.x + candidate.width);
+      if (!region) return null;
+      const correctCount = Math.round(region.evaluation.accuracy * TARGET_EXECUTION_COUNT);
+      return { x, y: region.y, html: PREDICTOR_LABELS[region.evaluation.predictorName] + " <b>" + BranchBook.formatPercent(region.evaluation.accuracy, 2) + "</b> · " + correctCount + " / " + TARGET_EXECUTION_COUNT + "회" };
+    });
+
+    const lineCanvas = BranchBook.createCanvas("duel-line-canvas", (context, width, height, palette) => {
+      lineChart = BranchBook.drawChart(context, { x: 56, y: 14, width: width - 74, height: height - 64 }, {
+        xMinimum: 0, xMaximum: TARGET_EXECUTION_COUNT, yMinimum: 0, yMaximum: PERCENT_SCALE,
+        xTicks: 4, yTicks: 4, xLabel: "표적 분기를 실행한 횟수", yLabel: "최근 " + RUNNING_WINDOW_LENGTH + "회 정확도 (%)",
+        xFormat: (value) => String(Math.round(value)),
+      });
+      evaluations.forEach((evaluation) => {
+        BranchBook.drawLine(context, lineChart, evaluation.runningPoints, palette.series[PREDICTOR_SERIES_INDEX[evaluation.predictorName]]);
+      });
+    });
+    BranchBook.attachTooltip("duel-line-canvas", (x) => {
+      if (!lineChart || evaluations.length === 0) return null;
+      const bounds = lineChart.bounds;
+      if (x < bounds.x || x > bounds.x + bounds.width) return null;
+      const executionNumber = ((x - bounds.x) / bounds.width) * TARGET_EXECUTION_COUNT;
+      const sampleCount = evaluations[0].runningPoints.length;
+      const sampleIndex = BranchBook.clamp(Math.round(executionNumber / RUNNING_SAMPLE_STEP) - 1, 0, sampleCount - 1);
+      const parts = evaluations.map((evaluation) => PREDICTOR_LABELS[evaluation.predictorName] + " <b>" + evaluation.runningPoints[sampleIndex][1].toFixed(0) + "%</b>");
+      const highestValue = Math.max(...evaluations.map((evaluation) => evaluation.runningPoints[sampleIndex][1]));
+      return { x, y: lineChart.toY(highestValue), html: evaluations[0].runningPoints[sampleIndex][0] + "회째 · " + parts.join(" · ") };
+    });
+    refresh();
+  })();
+
+  /* ============================================================ 실험 2: history 길이가 맞아야 한다 */
+  (function setupLengthExperiment() {
+    const TARGET_ADDRESS = 0x40;
+    const SOURCE_ADDRESS = 0x80;
+    const FILLER_BASE_ADDRESS = 0x100;
+    const ADDRESS_STEP = 4;
+    const ROUND_COUNT = 1100;
+    const MAXIMUM_HISTORY_LENGTH = 20;
+    const GSHARE_INDEX_BITS = 12;
+    const TRACE_SEED = 5;
+    const EVEN_PROBABILITY = 0.5;
+    const FILLER_TAKEN_PROBABILITY = { steady: 1, occasional: 0.9, random: 0.5 };
+    const ACCURACY_AXIS_MINIMUM = 40;
+    const ACCURACY_AXIS_TICKS = [40, 55, 70, 85, 100];
+    const HISTORY_AXIS_TICKS = [1, 5, 10, 15, 20];
+    const MARKER_LABEL_ROOM = 76;
+    const MARKER_LABEL_GAP = 12;
+    const MARKER_LABEL_OFFSET = 16;
+    const sweepCache = new Map();
+
+    function buildTrace(distance, fillerTakenProbability) {
+      const random = BranchBook.createRandom(TRACE_SEED);
+      const trace = [];
+      for (let roundIndex = 0; roundIndex < ROUND_COUNT; roundIndex++) {
+        const isSourceTaken = random() < EVEN_PROBABILITY;
+        trace.push({ address: SOURCE_ADDRESS, taken: isSourceTaken });
+        for (let fillerIndex = 0; fillerIndex < distance - 1; fillerIndex++) {
+          trace.push({ address: FILLER_BASE_ADDRESS + fillerIndex * ADDRESS_STEP, taken: random() < fillerTakenProbability });
+        }
+        trace.push({ address: TARGET_ADDRESS, taken: isSourceTaken });
+      }
+      return trace;
+    }
+
+    /** 한 (거리, 사이 분기) 설정에서 history 길이 1..20 전부의 정확도를 구한다. 슬라이더를 움직일 때 다시 계산하지 않도록 결과를 기억해 둔다. */
+    function sweep(distance, fillerName) {
+      const cacheKey = distance + "|" + fillerName;
+      if (sweepCache.has(cacheKey)) return sweepCache.get(cacheKey);
+      const trace = buildTrace(distance, FILLER_TAKEN_PROBABILITY[fillerName]);
+      // 표적 분기가 실행될 때마다 직전 방향 기록을 길이별로 잘라 모은다. 길이가 늘 때 배워야 할 경우가 얼마나 느는지 보여 주기 위해서다.
+      const distinctHistories = Array.from({ length: MAXIMUM_HISTORY_LENGTH }, () => new Set());
+      const recentMask = (1 << MAXIMUM_HISTORY_LENGTH) - 1;
+      let recentDirections = 0;
+      trace.forEach((branch) => {
+        if (branch.address === TARGET_ADDRESS) {
+          for (let historyLength = 1; historyLength <= MAXIMUM_HISTORY_LENGTH; historyLength++) {
+            distinctHistories[historyLength - 1].add(recentDirections & ((1 << historyLength) - 1));
+          }
+        }
+        recentDirections = ((recentDirections << 1) | (branch.taken ? 1 : 0)) & recentMask;
+      });
+      const accuracies = [];
+      for (let historyLength = 1; historyLength <= MAXIMUM_HISTORY_LENGTH; historyLength++) {
+        const predictor = BranchBook.predictors.createGshare({ indexBits: GSHARE_INDEX_BITS, historyLength });
+        const targetRecord = BranchBook.runPredictor(predictor, trace).perAddress.get(TARGET_ADDRESS);
+        accuracies.push(1 - targetRecord.mispredictionCount / targetRecord.executionCount);
+      }
+      const sweepResult = { accuracies, distinctHistoryCounts: distinctHistories.map((histories) => histories.size) };
+      sweepCache.set(cacheKey, sweepResult);
+      return sweepResult;
+    }
+
+    function currentSweep() {
+      return sweep(distanceControl.value, fillerControl.value);
+    }
+
+    function refresh() {
+      const sweepResult = currentSweep();
+      const historyLength = historyControl.value;
+      const distance = distanceControl.value;
+      const accuracy = sweepResult.accuracies[historyLength - 1];
+      let bestHistoryLength = 1;
+      sweepResult.accuracies.forEach((candidateAccuracy, lengthIndex) => {
+        if (candidateAccuracy > sweepResult.accuracies[bestHistoryLength - 1]) bestHistoryLength = lengthIndex + 1;
+      });
+      BranchBook.setContent("length-accuracy", BranchBook.formatPercent(accuracy));
+      BranchBook.setContent("length-reach", historyLength >= distance ? "들어온다" : "못 들어온다");
+      BranchBook.setContent("length-distinct", sweepResult.distinctHistoryCounts[historyLength - 1].toLocaleString("en-US") + "<small>가지 / " + ROUND_COUNT.toLocaleString("en-US") + "회</small>");
+      BranchBook.setContent("length-best", bestHistoryLength + "<small>bit · " + BranchBook.formatPercent(sweepResult.accuracies[bestHistoryLength - 1], 0) + "</small>");
+      windowCanvas.redraw();
+      curveCanvas.redraw();
+    }
+
+    const distanceControl = BranchBook.bindRange("length-distance", (value) => value + "개 앞", refresh);
+    const historyControl = BranchBook.bindRange("length-history", (value) => value + " bit", refresh);
+    const fillerControl = BranchBook.bindSegmented("length-filler", refresh);
+
+    const windowCanvas = BranchBook.createCanvas("length-window-canvas", (context, width, height, palette) => {
+      const distance = distanceControl.value;
+      const historyLength = historyControl.value;
+      const sideMargin = 8;
+      const cellCount = MAXIMUM_HISTORY_LENGTH + 1;
+      const cellStep = (width - sideMargin * 2) / cellCount;
+      const cellWidth = cellStep - 2;
+      const cellHeight = 24;
+      const cellsTop = 30;
+      const gshareColor = palette.series[PREDICTOR_SERIES_INDEX.gshare];
+      // 가장 오른쪽 칸이 표적 분기, 그 왼쪽으로 한 칸씩 과거로 간다.
+      function cellLeft(position) { return sideMargin + (MAXIMUM_HISTORY_LENGTH - position) * cellStep + 1; }
+      for (let position = MAXIMUM_HISTORY_LENGTH; position >= 0; position--) {
+        let fillColor = palette.surface;
+        if (position < distance) fillColor = palette.surfaceStrong;
+        if (position === distance) fillColor = palette.accent;
+        if (position === 0) fillColor = palette.elevated;
+        context.fillStyle = fillColor;
+        BranchBook.roundedRectangle(context, cellLeft(position), cellsTop, cellWidth, cellHeight, 4);
+        context.fill();
+        if (position === 0) {
+          context.strokeStyle = palette.text;
+          context.lineWidth = 2;
+          context.stroke();
+        }
+      }
+      context.font = "600 12px " + palette.font;
+      context.textBaseline = "bottom";
+      context.fillStyle = palette.text;
+      context.textAlign = "right";
+      context.fillText("표적", width - sideMargin, cellsTop - 6);
+      const sourceCenterX = cellLeft(distance) + cellWidth / 2;
+      const sourceLabel = "원인 분기";
+      const sourceLabelHalfWidth = context.measureText(sourceLabel).width / 2;
+      const targetLabelWidth = context.measureText("표적").width;
+      context.fillStyle = palette.accent;
+      context.textAlign = "center";
+      context.fillText(sourceLabel, BranchBook.clamp(sourceCenterX, sideMargin + sourceLabelHalfWidth, width - sideMargin - targetLabelWidth - 10 - sourceLabelHalfWidth), cellsTop - 6);
+      // gshare가 보는 범위를 칸 아래에 꺾쇠로 표시한다.
+      const bracketLeft = cellLeft(historyLength);
+      const bracketRight = cellLeft(1) + cellWidth;
+      const bracketY = cellsTop + cellHeight + 9;
+      context.strokeStyle = gshareColor;
+      context.lineWidth = 2;
+      context.beginPath();
+      context.moveTo(bracketLeft, bracketY - 5);
+      context.lineTo(bracketLeft, bracketY);
+      context.lineTo(bracketRight, bracketY);
+      context.lineTo(bracketRight, bracketY - 5);
+      context.stroke();
+      const isReaching = historyLength >= distance;
+      const bracketLabel = "gshare가 보는 최근 " + historyLength + "개" + (isReaching ? ": 원인 분기 포함" : ": 원인 분기에 닿지 않음");
+      context.font = "12px " + palette.font;
+      context.textBaseline = "top";
+      context.fillStyle = palette.text;
+      const bracketLabelHalfWidth = context.measureText(bracketLabel).width / 2;
+      context.fillText(bracketLabel, BranchBook.clamp((bracketLeft + bracketRight) / 2, sideMargin + bracketLabelHalfWidth, width - sideMargin - bracketLabelHalfWidth), bracketY + 7);
+      context.fillStyle = palette.textDim;
+      context.textAlign = "left";
+      context.fillText("← 과거", sideMargin, bracketY + 26);
+    });
+
+    let curveChart = null;
+    const curveCanvas = BranchBook.createCanvas("length-curve-canvas", (context, width, height, palette) => {
+      const sweepResult = currentSweep();
+      const distance = distanceControl.value;
+      const historyLength = historyControl.value;
+      const gshareColor = palette.series[PREDICTOR_SERIES_INDEX.gshare];
+      const bounds = { x: 56, y: 16, width: width - 74, height: height - 66 };
+      // 격자보다 먼저 칠해야 격자선이 가려지지 않는다.
+      const toXBeforeChart = (value) => bounds.x + ((value - 1) / (MAXIMUM_HISTORY_LENGTH - 1)) * bounds.width;
+      if (distance > 1) {
+        context.fillStyle = palette.surfaceStrong;
+        context.fillRect(bounds.x, bounds.y, toXBeforeChart(distance - 0.5) - bounds.x, bounds.height);
+      }
+      curveChart = BranchBook.drawChart(context, bounds, {
+        xMinimum: 1, xMaximum: MAXIMUM_HISTORY_LENGTH, yMinimum: ACCURACY_AXIS_MINIMUM, yMaximum: PERCENT_SCALE,
+        xTicks: HISTORY_AXIS_TICKS, yTicks: ACCURACY_AXIS_TICKS, xLabel: "gshare history 길이 (bit)", yLabel: "표적 분기 정확도 (%)",
+        xFormat: (value) => String(value), yFormat: (value) => String(value),
+      });
+      const points = sweepResult.accuracies.map((accuracy, lengthIndex) => [lengthIndex + 1, accuracy * PERCENT_SCALE]);
+      BranchBook.drawLine(context, curveChart, points, gshareColor);
+      points.forEach((point) => {
+        context.fillStyle = gshareColor;
+        context.beginPath();
+        context.arc(curveChart.toX(point[0]), curveChart.toY(point[1]), 3, 0, Math.PI * 2);
+        context.fill();
+      });
+      // 상관 거리: 이 길이부터 원인 분기가 history에 들어온다.
+      const distanceX = curveChart.toX(distance);
+      context.strokeStyle = palette.accent;
+      context.lineWidth = 1.5;
+      context.setLineDash([5, 4]);
+      context.beginPath();
+      context.moveTo(distanceX, bounds.y);
+      context.lineTo(distanceX, bounds.y + bounds.height);
+      context.stroke();
+      context.setLineDash([]);
+      context.fillStyle = palette.accent;
+      context.font = "600 12px " + palette.font;
+      context.textBaseline = "top";
+      const isDistanceLabelOnLeft = distanceX > bounds.x + bounds.width - 70;
+      context.textAlign = isDistanceLabelOnLeft ? "right" : "left";
+      context.fillText("거리 " + distance, distanceX + (isDistanceLabelOnLeft ? -6 : 6), bounds.y + 4);
+      const markerX = curveChart.toX(historyLength);
+      const markerY = curveChart.toY(sweepResult.accuracies[historyLength - 1] * PERCENT_SCALE);
+      context.fillStyle = gshareColor;
+      context.strokeStyle = palette.background;
+      context.lineWidth = 2;
+      context.beginPath();
+      context.arc(markerX, markerY, 7, 0, Math.PI * 2);
+      context.fill();
+      context.stroke();
+      // 라벨이 곡선의 가파른 구간(절벽)과 겹치지 않도록, 절벽의 반대쪽에 둔다.
+      const isMarkerBeforeCliff = historyLength < distance;
+      const hasRoomOnLeft = markerX - bounds.x > MARKER_LABEL_ROOM;
+      const hasRoomOnRight = bounds.x + bounds.width - markerX > MARKER_LABEL_ROOM;
+      let isMarkerLabelOnLeft = isMarkerBeforeCliff;
+      if (!hasRoomOnLeft) isMarkerLabelOnLeft = false;
+      if (!hasRoomOnRight) isMarkerLabelOnLeft = true;
+      const isMarkerNearTop = markerY < bounds.y + MARKER_LABEL_OFFSET * 2;
+      context.fillStyle = palette.text;
+      context.textAlign = isMarkerLabelOnLeft ? "right" : "left";
+      context.textBaseline = "middle";
+      context.fillText("현재 설정", markerX + (isMarkerLabelOnLeft ? -MARKER_LABEL_GAP : MARKER_LABEL_GAP), markerY + (isMarkerNearTop ? MARKER_LABEL_OFFSET : -MARKER_LABEL_OFFSET));
+    });
+    BranchBook.attachTooltip("length-curve-canvas", (x) => {
+      if (!curveChart) return null;
+      const bounds = curveChart.bounds;
+      if (x < bounds.x - 8 || x > bounds.x + bounds.width + 8) return null;
+      const historyLength = BranchBook.clamp(Math.round(1 + ((x - bounds.x) / bounds.width) * (MAXIMUM_HISTORY_LENGTH - 1)), 1, MAXIMUM_HISTORY_LENGTH);
+      const sweepResult = currentSweep();
+      const accuracy = sweepResult.accuracies[historyLength - 1];
+      return {
+        x: curveChart.toX(historyLength), y: curveChart.toY(accuracy * PERCENT_SCALE),
+        html: "history " + historyLength + " bit → 정확도 <b>" + BranchBook.formatPercent(accuracy) + "</b> · 서로 다른 history <b>" + sweepResult.distinctHistoryCounts[historyLength - 1] + "</b>가지",
+      };
+    });
+    refresh();
+  })();
+
+  /* ============================================================ 실험 3: TAGE 안을 들여다보기 */
+  (function setupInsideExperiment() {
+    const TRACE_LENGTH = 16000;
+    const TRACE_SEED = 21;
+    const FIRST_ADDRESS = 0x1000;
+    const ADDRESS_STEP = 0x24;
+    const FIXED_BRANCH_COUNT = 10;
+    const LOOP_TRIP_COUNTS = [3, 5, 7, 10, 14, 20, 28, 40, 52];
+    const MAXIMUM_TRIP_COUNT_WITH_BODY_BRANCH = 14;
+    const BODY_BRANCH_PERIOD = 3;
+    const CORRELATION_DISTANCES = [3, 6, 10, 18];
+    const DATA_BRANCH_COUNT = 2;
+    const EVEN_PROBABILITY = 0.5;
+    const REFERENCE_TABLE_INDEX_BITS = 10;
+    const BASE_TABLE_LABEL = "base";
+    const DIFFERENCE_ROUNDING_SCALE = 10;
+    const inspectionCache = new Map();
+
+    /** 여러 종류의 분기가 한 프로그램 안에서 차례로 실행되는 trace를 만든다. 종류마다 필요한 history 길이가 다르도록 골랐다. */
+    function buildMixedTrace() {
+      const random = BranchBook.createRandom(TRACE_SEED);
+      const trace = [];
+      const segments = [];
+      let nextAddress = FIRST_ADDRESS;
+      function allocateAddress() {
+        nextAddress += ADDRESS_STEP;
+        return nextAddress;
+      }
+      for (let fixedIndex = 0; fixedIndex < FIXED_BRANCH_COUNT; fixedIndex++) {
+        const address = allocateAddress();
+        const isTaken = fixedIndex % 2 === 0;
+        segments.push(() => trace.push({ address, taken: isTaken }));
+      }
+      LOOP_TRIP_COUNTS.forEach((tripCount) => {
+        const loopAddress = allocateAddress();
+        const bodyAddress = allocateAddress();
+        const hasBodyBranch = tripCount <= MAXIMUM_TRIP_COUNT_WITH_BODY_BRANCH;
+        segments.push(() => {
+          for (let iteration = 0; iteration < tripCount; iteration++) {
+            if (hasBodyBranch) trace.push({ address: bodyAddress, taken: iteration % BODY_BRANCH_PERIOD === 0 });
+            trace.push({ address: loopAddress, taken: iteration !== tripCount - 1 });
+          }
+        });
+      });
+      CORRELATION_DISTANCES.forEach((distance) => {
+        const sourceAddress = allocateAddress();
+        const targetAddress = allocateAddress();
+        const fillerAddress = allocateAddress();
+        segments.push(() => {
+          const isSourceTaken = random() < EVEN_PROBABILITY;
+          trace.push({ address: sourceAddress, taken: isSourceTaken });
+          for (let fillerIndex = 0; fillerIndex < distance - 1; fillerIndex++) trace.push({ address: fillerAddress, taken: true });
+          trace.push({ address: targetAddress, taken: isSourceTaken });
+        });
+      });
+      for (let dataIndex = 0; dataIndex < DATA_BRANCH_COUNT; dataIndex++) {
+        const address = allocateAddress();
+        segments.push(() => trace.push({ address, taken: random() < EVEN_PROBABILITY }));
+      }
+      while (trace.length < TRACE_LENGTH) segments.forEach((runSegment) => runSegment());
+      return trace.slice(0, TRACE_LENGTH);
+    }
+    const mixedTrace = buildMixedTrace();
+
+    /** 주어진 표 크기의 TAGE를 돌리며, 예측마다 어느 표가 답했는지 센다. */
+    function inspect(tableIndexBits) {
+      if (inspectionCache.has(tableIndexBits)) return inspectionCache.get(tableIndexBits);
+      const predictor = BranchBook.predictors.createTage({ tableIndexBits });
+      const providerRecords = [0].concat(predictor.historyLengths).map((historyLength) => ({ historyLength, predictionCount: 0, mispredictionCount: 0 }));
+      let mispredictionCount = 0;
+      mixedTrace.forEach((branch) => {
+        const prediction = predictor.predict(branch.address);
+        const record = providerRecords[prediction.providerTable + 1];
+        record.predictionCount++;
+        if (prediction.taken !== branch.taken) {
+          record.mispredictionCount++;
+          mispredictionCount++;
+        }
+        predictor.update(branch.address, branch.taken);
+      });
+      const inspection = { accuracy: 1 - mispredictionCount / mixedTrace.length, providerRecords, statistics: predictor.statistics(), historyLengths: predictor.historyLengths };
+      inspectionCache.set(tableIndexBits, inspection);
+      return inspection;
+    }
+
+    function providerLabel(historyLength) {
+      return historyLength === 0 ? BASE_TABLE_LABEL : String(historyLength);
+    }
+
+    function refresh() {
+      const inspection = inspect(sizeControl.value);
+      const reference = inspect(REFERENCE_TABLE_INDEX_BITS);
+      const occupiedTotal = inspection.statistics.occupiedEntries.reduce((sum, occupiedCount) => sum + occupiedCount, 0);
+      const capacityTotal = inspection.statistics.tableSize * inspection.statistics.occupiedEntries.length;
+      const differencePoints = (inspection.accuracy - reference.accuracy) * PERCENT_SCALE;
+      BranchBook.setContent("inside-accuracy", BranchBook.formatPercent(inspection.accuracy));
+      // 반올림하면 0인 차이에 음수 부호가 붙지 않도록 먼저 반올림한 값으로 부호를 정한다.
+      const roundedDifference = Math.round(differencePoints * DIFFERENCE_ROUNDING_SCALE) / DIFFERENCE_ROUNDING_SCALE;
+      let differenceText = roundedDifference.toFixed(1);
+      if (roundedDifference > 0) differenceText = "+" + differenceText;
+      if (roundedDifference === 0) differenceText = "0.0";
+      BranchBook.setContent("inside-difference", differenceText + "<small>%p</small>");
+      BranchBook.setContent("inside-allocations", inspection.statistics.allocationCount.toLocaleString("en-US") + "<small>회</small>");
+      BranchBook.setContent("inside-occupancy", occupiedTotal + "<small>/ " + capacityTotal.toLocaleString("en-US") + "칸</small>");
+      providerCanvas.redraw();
+      occupancyCanvas.redraw();
+    }
+
+    const sizeControl = BranchBook.bindRange("inside-size", (value) => (1 << value).toLocaleString("en-US") + "칸", refresh);
+
+    let providerBarRegions = [];
+    const providerCanvas = BranchBook.createCanvas("inside-provider-canvas", (context, width, height, palette) => {
+      const inspection = inspect(sizeControl.value);
+      const recordCount = inspection.providerRecords.length;
+      const chart = BranchBook.drawChart(context, { x: 56, y: 26, width: width - 70, height: height - 84 }, {
+        xMinimum: 0, xMaximum: recordCount, yMinimum: 0, yMaximum: PERCENT_SCALE,
+        xTicks: [], yTicks: 4, hideXGrid: true, xLabel: "provider 표가 보는 history 길이 (bit)", yLabel: "전체 예측 가운데 비율 (%)",
+      });
+      const slotWidth = chart.bounds.width / recordCount;
+      const barWidth = Math.min(54, slotWidth * 0.62);
+      const baselineY = chart.toY(0);
+      providerBarRegions = [];
+      inspection.providerRecords.forEach((record, recordIndex) => {
+        const centerX = chart.bounds.x + slotWidth * (recordIndex + 0.5);
+        const share = record.predictionCount / mixedTrace.length;
+        const mispredictedShare = record.mispredictionCount / mixedTrace.length;
+        const barHeight = share * chart.bounds.height;
+        const mispredictedHeight = mispredictedShare * chart.bounds.height;
+        if (barHeight > 0) BranchBook.drawBar(context, centerX - barWidth / 2, baselineY, barWidth, barHeight, palette.series[PREDICTOR_SERIES_INDEX.tage]);
+        if (mispredictedHeight >= 1) {
+          // 틀린 예측은 막대의 맨 위 구간에 따로 칠하고, 그 위에 ✕와 횟수를 적는다.
+          context.fillStyle = palette.mispredict;
+          context.fillRect(centerX - barWidth / 2, baselineY - barHeight, barWidth, mispredictedHeight);
+        }
+        context.textAlign = "center";
+        context.textBaseline = "bottom";
+        context.font = "600 11px " + palette.mono;
+        context.fillStyle = palette.mispredict;
+        context.fillText("✕" + record.mispredictionCount, centerX, baselineY - barHeight - 4);
+        context.textBaseline = "top";
+        context.fillStyle = palette.textDim;
+        context.font = "11px " + palette.mono;
+        context.fillText(providerLabel(record.historyLength), centerX, baselineY + 8);
+        providerBarRegions.push({ left: chart.bounds.x + slotWidth * recordIndex, right: chart.bounds.x + slotWidth * (recordIndex + 1), centerX, topY: baselineY - barHeight, record });
+      });
+    });
+    BranchBook.attachTooltip("inside-provider-canvas", (x) => {
+      const region = providerBarRegions.find((candidate) => x >= candidate.left && x < candidate.right);
+      if (!region) return null;
+      const record = region.record;
+      const tableName = record.historyLength === 0 ? "base 표" : "history " + record.historyLength + " 표";
+      return { x: region.centerX, y: region.topY - 14, html: tableName + " · 예측 <b>" + record.predictionCount.toLocaleString("en-US") + "</b>회 (" + BranchBook.formatPercent(record.predictionCount / mixedTrace.length) + ") · ✕ 틀림 <b>" + record.mispredictionCount + "</b>회" };
+    });
+
+    let occupancyRowRegions = [];
+    const occupancyCanvas = BranchBook.createCanvas("inside-occupancy-canvas", (context, width, height, palette) => {
+      const inspection = inspect(sizeControl.value);
+      const tableSize = inspection.statistics.tableSize;
+      const labelWidth = 74;
+      const valueWidth = 84;
+      const barHeight = 18;
+      const rowGap = 10;
+      const barLeft = labelWidth + 8;
+      const barWidth = width - barLeft - valueWidth - 4;
+      const top = 6;
+      occupancyRowRegions = [];
+      context.textBaseline = "middle";
+      inspection.statistics.occupiedEntries.forEach((occupiedCount, tableNumber) => {
+        const y = top + tableNumber * (barHeight + rowGap);
+        context.fillStyle = palette.surface;
+        BranchBook.roundedRectangle(context, barLeft, y, barWidth, barHeight, 4);
+        context.fill();
+        if (occupiedCount > 0) {
+          context.fillStyle = palette.series[PREDICTOR_SERIES_INDEX.tage];
+          BranchBook.roundedRectangle(context, barLeft, y, Math.max(4, barWidth * (occupiedCount / tableSize)), barHeight, 4);
+          context.fill();
+        }
+        context.fillStyle = palette.text;
+        context.font = "12px " + palette.font;
+        context.textAlign = "right";
+        context.fillText("history " + inspection.historyLengths[tableNumber], labelWidth, y + barHeight / 2);
+        context.font = "600 12px " + palette.mono;
+        context.textAlign = "left";
+        context.fillText(occupiedCount + " / " + tableSize, barLeft + barWidth + 8, y + barHeight / 2);
+        occupancyRowRegions.push({ y, height: barHeight, historyLength: inspection.historyLengths[tableNumber], occupiedCount, tableSize });
+      });
+    });
+    BranchBook.attachTooltip("inside-occupancy-canvas", (x, y) => {
+      const region = occupancyRowRegions.find((candidate) => y >= candidate.y - 4 && y <= candidate.y + candidate.height + 4);
+      if (!region) return null;
+      return { x, y: region.y, html: "history " + region.historyLength + " 표 · <b>" + region.occupiedCount + "</b> / " + region.tableSize + "칸 사용 (" + BranchBook.formatPercent(region.occupiedCount / region.tableSize, 0) + ")" };
+    });
+    refresh();
+  })();
+
+  /* ============================================================ 퀴즈 */
+  BranchBook.renderQuiz("chapter-quiz", [
+    {
+      question: "번갈아 나오는 분기 T, N, T, N…을 2-bit 카운터 하나는 놓치고 gshare는 맞히는 이유는?",
+      options: ["gshare의 카운터가 더 넓기 때문이다", "gshare는 직전 방향에 따라 서로 다른 카운터를 쓰므로, 각 카운터는 한쪽으로 치우친 쉬운 분기를 맡게 되기 때문이다", "gshare는 분기 주소를 쓰지 않기 때문이다", "gshare는 루프 횟수를 세기 때문이다"],
+      answerIndex: 1,
+      explanation: "history가 색인에 들어가면 '직전이 T일 때'와 '직전이 N일 때'가 서로 다른 칸이 된다. 두 칸은 각각 늘 같은 방향만 보게 된다.",
+    },
+    {
+      question: "표적 분기의 방향이 12개 앞 분기의 방향과 같다. history 8 bit짜리 gshare의 정확도가 50% 근처인 이유는?",
+      options: ["표가 너무 커서", "원인 분기의 방향이 history 창 밖에 있어서, 예측기가 볼 수 있는 정보에 답이 없기 때문이다", "XOR 연산이 틀려서", "카운터가 포화되어서"],
+      answerIndex: 1,
+      explanation: "history 길이가 상관 거리보다 짧으면 원인이 창에 들어오지 않는다. 실험 2의 곡선에서 절벽 왼쪽에 해당한다.",
+    },
+    {
+      question: "필요한 것보다 훨씬 긴 history를 쓰면 생기는 손해로 맞는 것은?",
+      options: ["먼 상관을 볼 수 없게 된다", "창에 들어온 무관한 분기들 때문에 구별해야 할 history가 늘어, 같은 규칙을 여러 번 따로 배워야 하고 표의 칸이 모자라진다", "예측기가 history를 무시한다", "손해가 없다"],
+      answerIndex: 1,
+      explanation: "history가 한 bit 늘 때마다 가능한 가짓수는 최대 두 배가 된다. 사이에 낀 분기가 제멋대로일수록 이 비용이 크다.",
+    },
+    {
+      question: "TAGE에서 표 1(history 4)과 표 3(history 16)의 tag가 일치하고 나머지는 일치하지 않았다. 예측은 어디서 나오는가?",
+      options: ["base 표", "표 1. 짧은 history가 더 믿을 만하기 때문이다", "표 3. 일치한 표 가운데 history가 가장 길기 때문이다", "두 표의 다수결"],
+      answerIndex: 2,
+      explanation: "가장 긴 history로 일치한 표가 provider다. 더 긴 history로 일치했다는 것은 더 구체적인 상황을 알아봤다는 뜻이다. 표 1은 대안으로 남는다.",
+    },
+    {
+      question: "64KB TAGE-SC-L로도 남는 오예측 가운데, 예측기의 표를 키워도 줄지 않는 것은 어느 쪽인가?",
+      options: ["표가 모자라서 밀려난 패턴 때문에 생긴 오예측", "방향이 방금 읽은 데이터 값으로 정해져서, 과거 방향 기록에 답이 없는 분기의 오예측", "처음 실행되는 분기의 오예측", "base 표의 aliasing 때문에 생긴 오예측"],
+      answerIndex: 1,
+      explanation: "정보의 벽이다. 답이 history에 없으면 표를 얼마나 키워도 배울 것이 없다. 이런 분기에는 값을 보거나 미리 계산하는 다른 종류의 방법이 필요하다.",
+    },
+  ]);
+})();
+</script>
+</body>
+</html>

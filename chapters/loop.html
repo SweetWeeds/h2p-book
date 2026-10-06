@@ -1,0 +1,871 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7장 · 서로 얽힌 루프 분기: Phelps — BranchBook</title>
+<meta name="description" content="어려운 분기가 다른 어려운 분기를 가로막고, 조건부 store가 다음 반복의 답을 바꾸는 루프. Phelps가 분기를 조건값으로 바꿔 미리 계산하고 반복 단위 queue로 전달하는 방법을 실험으로 배운다.">
+<link rel="icon" href="../favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/common.js"></script>
+<style>
+  /* 실험 1의 반복 표: 열이 많아 좁은 화면에서도 한눈에 들어오도록 칸을 줄인다 */
+  .trace-table-wrap { margin: 0; }
+  .trace-table { font-size: 13px; }
+  .trace-table th, .trace-table td { padding: 5px 4px; text-align: center; vertical-align: middle; white-space: nowrap; }
+  .trace-table th.group-heading { font-size: 12.5px; border-left: 1px solid var(--border); }
+  .trace-table td.group-start, .trace-table th.group-start { border-left: 1px solid var(--border); }
+  .trace-table td.value-cell { font-family: var(--mono); }
+  .trace-table tr.pending-row td { color: var(--text-faint); }
+  .trace-table tr.current-row td { background: var(--accent-soft); }
+  .trace-table .outcome-cell { width: 24px; height: 24px; }
+  .outcome-cell.bracketed { background: var(--surface-strong); color: var(--text-dim); font-size: 11px; }
+  .step-narration { margin: 10px 4px 2px; font-size: 14px; line-height: 1.65; color: var(--text); min-height: 3.3em; }
+  @media (max-width: 560px) {
+    .trace-table { font-size: 12px; }
+    .trace-table th, .trace-table td { padding: 4px 2px; }
+    .trace-table .outcome-cell { width: 22px; height: 22px; }
+  }
+</style>
+</head>
+<body data-root="../" data-chapter="loop">
+<main class="chapter">
+  <header class="chapter-hero">
+    <p class="chapter-kicker"></p>
+    <h1>서로 얽힌 루프 분기: Phelps</h1>
+    <p class="lead">5장의 helper는 어려운 분기 하나의 계산을 떼어 내 먼저 실행했다. 그런데 루프 안에서는 어려운 분기가 다른 어려운 분기의 실행 여부를 정하고, 그 분기들이 막고 있는 store가 다음 반복의 답을 바꾸기도 한다. Phelps는 이런 루프에서 분기를 조건값으로 바꿔 모두 미리 계산하고, 그 결과를 반복 단위로 맞춰 main에 전달한다.</p>
+    <div class="objectives">
+      <p class="objectives-title">이 장에서 배우는 것</p>
+      <ul>
+        <li>분기 사이의 제어 의존과 store 의존이 기존 선행 계산을 어떻게 막는지 설명할 수 있다.</li>
+        <li>분기를 predicate로 바꾸면 helper 안에서 예측과 되돌리기가 사라지는 이유를 이해한다.</li>
+        <li>분기별 결과 queue를 반복 단위로 함께 움직여야 하는 이유를 직접 확인한다.</li>
+        <li>코어 자원을 나누는 비용과 오예측 감소의 이득을 저울질해, 기법이 손해가 되는 조건을 찾는다.</li>
+      </ul>
+    </div>
+  </header>
+
+  <!-- ============================================================ 1 -->
+  <section id="phelps">
+    <h2>Phelps가 푸는 두 가지 문제</h2>
+    <div class="paper-card">
+      <span class="paper-title">Delinquent Loop Pre-execution Using Predicated Helper Threads (Phelps)</span>
+      <span class="paper-meta">Anirudh Seshadri, Eric Rotenberg · HPCA 2025 · <a href="https://ericrotenberg.wordpress.ncsu.edu/files/2025/06/paper_HPCA-31_Phelps.pdf" rel="noopener">원문</a></span>
+      <span class="paper-scope">평가 조건: 64KB TAGE-SC-L baseline, 8-wide RISC-V 코어 모델(ROB 632), GAP(roadNet-CA 입력)·SPEC2006 astar·SPEC2017 정수 · <b>근거 범위: 논문 전문</b></span>
+    </div>
+    <p><a href="value.html">5장</a>에서 본 선행 계산은 이렇게 요약된다. 자주 틀리는 분기의 조건을 만드는 명령만 추려서, <span class="term">helper</span>가 main보다 먼저 실행하고, 나온 결과를 fetch 단계에 넘겨준다. 논문은 이렇게 자주 실행되면서 자주 틀리는 분기를 <span class="term">delinquent branch</span>라고 부른다. <a href="h2p.html">3장</a>의 H2P와 같은 대상이다.</p>
+    <p>이 방법은 분기 하나의 계산 사슬이 다른 어려운 분기와 떨어져 있을 때 잘 맞는다. Phelps 논문은 사슬이 서로 얽히는 두 경우를 짚는다. 아래 루프로 살펴보자. 격자의 칸을 하나씩 꺼내, 아직 방문하지 않았고 막혀 있지도 않으면 방문했다고 표시한다.</p>
+<pre><code>for (step = 0; step &lt; count; step++) {
+    cell = neighbor[step];        // 매 반복 다른 칸을 가리킨다
+    if (visited[cell]) continue;  // b1: 이미 방문한 칸이면 건너뛴다
+    if (blocked[cell]) continue;  // b2: b1이 not-taken일 때만 검사한다
+    visited[cell] = 1;            // s1: 두 분기를 모두 통과했을 때만 실행한다
+}</code></pre>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 310" role="img" aria-label="분기 b1이 분기 b2를 가로막고, 두 분기가 store s1을 가로막으며, s1이 쓴 값을 뒤 반복의 b1이 읽는 의존 관계">
+        <defs>
+          <marker id="loop-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrow-head"/></marker>
+          <marker id="loop-arrow-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrow-head-accent"/></marker>
+        </defs>
+        <text x="20" y="26" class="label-strong">한 반복 안의 세 명령과 그 사이의 의존</text>
+        <rect x="70" y="44" width="330" height="52" rx="9" class="fill-accent-soft"/>
+        <text x="90" y="75" class="label-strong">b1</text><text x="128" y="75" class="label-mono">if (visited[cell]) continue;</text>
+        <rect x="70" y="124" width="330" height="52" rx="9" class="fill-accent-soft"/>
+        <text x="90" y="155" class="label-strong">b2</text><text x="128" y="155" class="label-mono">if (blocked[cell]) continue;</text>
+        <rect x="70" y="204" width="330" height="52" rx="9" class="fill-surface"/>
+        <text x="90" y="235" class="label-strong">s1</text><text x="128" y="235" class="label-mono">visited[cell] = 1;</text>
+        <path d="M235 96 V120" class="stroke-line" marker-end="url(#loop-arrow)"/>
+        <path d="M235 176 V200" class="stroke-line" marker-end="url(#loop-arrow)"/>
+        <path d="M248 110 H414" class="stroke-dashed"/>
+        <path d="M248 190 H414" class="stroke-dashed"/>
+        <text x="424" y="75" class="label-dim">b1과 b2는 둘 다 자주 틀리는 분기다</text>
+        <text x="424" y="115" class="label">b1이 not-taken일 때만 b2를 실행한다</text>
+        <text x="424" y="195" class="label">b1, b2가 모두 not-taken일 때만 s1을 실행한다</text>
+        <text x="424" y="235" class="label-dim">s1은 b1이 읽는 배열에 값을 쓴다</text>
+        <path d="M70 230 C 14 230, 14 70, 62 70" class="stroke-accent" stroke-dasharray="6 4" marker-end="url(#loop-arrow-accent)"/>
+        <text x="20" y="288" class="label-accent">점선: 앞 반복의 s1이 쓴 값을 뒤 반복의 b1이 읽는다. 몇 반복 뒤에 읽을지는 매번 다르다.</text>
+      </svg>
+      <figcaption><b>그림 7-1.</b> 서로 의존하는 두 분기와 store. 원문 Fig. 1의 예를 이 장의 코드로 다시 그림. 실선은 제어 의존, 점선은 반복을 건너가는 데이터 의존이다.</figcaption>
+    </figure>
+    <h3>문제 1: 어려운 분기가 어려운 분기를 가로막는다</h3>
+    <p><code>b2</code>는 <code>b1</code>이 not-taken일 때만 실행된다. 논문의 용어로 b1은 <span class="term">guarding branch</span>, b2는 <span class="term">guarded branch</span>다. 둘 중 하나만 어렵다면 문제가 없다. 둘 다 어려우면 helper가 곤란해진다. b2를 미리 계산할지 정하려면 b1의 방향을 알아야 하는데, 그 b1이 바로 예측하기 어려운 분기다.</p>
+    <p>논문에 따르면 두 분기를 모두 다루는 선행 연구는 helper 안에서 b1을 다시 예측한다. 예측이 틀리면 helper가 한 일을 취소하고 되돌아가야 한다. 오예측이라는 병목이 main에서 helper로 자리만 옮긴 셈이다.</p>
+    <h3>문제 2: 분기가 막고 있는 store가 그 분기의 답을 바꾼다</h3>
+    <p><code>s1</code>은 두 분기를 모두 통과해야 실행된다. 그런데 s1이 쓴 <code>visited[cell]</code>은 나중에 같은 칸이 다시 나왔을 때 b1이 읽는 값이다. 곧 s1은 분기에 <strong>제어 의존</strong>하면서 동시에 분기의 결과에 <strong>영향</strong>을 준다. 어느 반복의 store가 어느 반복의 load와 만나는지는 칸의 순서에 따라 매번 달라진다.</p>
+    <p>논문은 선행 연구의 대응을 이렇게 정리한다. 일부는 helper에서 store를 아예 뺀다. <a href="value.html#runahead">Branch Runahead</a>는 store와 load의 의존을 처음 한 번 관찰하면 그 관계가 고정이라고 보고, 둘을 없앤 뒤 store에 값을 주던 명령과 load의 값을 쓰는 명령을 직접 잇는다. 어느 쪽이든 의존이 반복마다 달라지면 b1의 결과를 틀리게 계산할 수 있다.</p>
+    <div class="callout evidence">
+      <strong>논문의 실제 사례: astar</strong>
+      <p>논문은 SPEC2006 astar의 <code>makebound2()</code> 루프를 든다. 이 루프에는 그림 7-1과 같은 분기 쌍이 여덟 개 있고, <code>waymap[index1].fillnum</code>에 쓰는 store가 뒤 반복의 홀수 번째 분기에 영향을 준다. 이 루프가 두드러지는 구간(가중치가 가장 큰 SimPoint)은 64KB TAGE-SC-L에서 MPKI가 약 29이며, 대부분 이 열여섯 분기에서 나온다.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ 2 -->
+  <section id="predication">
+    <h2>분기를 조건값으로 바꾼다</h2>
+    <p>Phelps의 이름은 <em>predicated helper threads</em>에서 왔다. <span class="term">Predication</span>은 "조건에 따라 건너뛴다"를 "조건값을 계산해 두고, 그 값이 허락할 때만 효과를 낸다"로 바꾸는 방식이다. Phelps는 이를 helper에 적용한다.</p>
+    <ul>
+      <li><strong>분기는 predicate producer가 된다.</strong> helper 안에서 delinquent branch는 더 이상 흐름을 바꾸지 않는다. 방향을 계산해 조건값(<span class="term">predicate</span>)으로 내놓는 명령이 된다. 그래서 b1이 어느 쪽이든 b2도 <strong>매 반복 무조건</strong> 계산한다.</li>
+      <li><strong>store는 predicate를 받는다.</strong> 분기에 제어 의존하는 store는 그 분기의 predicate를 입력으로 받아, 조건이 맞을 때만 값을 쓴다. helper에 흐름이 없으므로 이 장치가 없으면 store가 매번 실행되어 버린다.</li>
+      <li><strong>남는 제어 흐름은 loop 분기 하나다.</strong> helper가 언제 끝나야 하는지 알기 위해서다.</li>
+    </ul>
+<pre><code>// helper가 매 반복 하는 일 (의미를 설명하는 의사 코드)
+p1 = visited[cell];                  // b1의 결과를 무조건 계산한다
+p2 = blocked[cell];                  // b2의 결과도 무조건 계산한다
+if (!p1 &amp;&amp; !p2) visited[cell] = 1;   // store는 predicate가 허락할 때만 효과를 낸다
+deposit(queue_b1, p1);
+deposit(queue_b2, p2);</code></pre>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 330" role="img" aria-label="helper 안에서 세 계산 사슬이 동시에 실행되고, 마지막 명령만 앞선 predicate를 기다리는 구조">
+        <defs><marker id="loop-slice-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrow-head"/></marker>
+        <marker id="loop-slice-arrow-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrow-head-accent"/></marker></defs>
+        <text x="20" y="26" class="label-strong">helper 안: 계산 사슬은 동시에, 마지막 명령만 predicate 순서대로</text>
+        <rect x="30" y="46" width="240" height="56" rx="9" class="fill-surface"/><text x="150" y="70" text-anchor="middle" class="label-strong">b1의 계산 사슬</text><text x="150" y="90" text-anchor="middle" class="label-mono">load visited[cell]</text>
+        <rect x="310" y="46" width="240" height="56" rx="9" class="fill-surface"/><text x="430" y="70" text-anchor="middle" class="label-strong">b2의 계산 사슬</text><text x="430" y="90" text-anchor="middle" class="label-mono">load blocked[cell]</text>
+        <rect x="590" y="46" width="240" height="56" rx="9" class="fill-surface"/><text x="710" y="70" text-anchor="middle" class="label-strong">s1의 계산 사슬</text><text x="710" y="90" text-anchor="middle" class="label-dim">쓸 주소와 값을 준비</text>
+        <path d="M150 102 V136" class="stroke-line" marker-end="url(#loop-slice-arrow)"/>
+        <path d="M430 102 V136" class="stroke-line" marker-end="url(#loop-slice-arrow)"/>
+        <path d="M710 102 V136" class="stroke-line" marker-end="url(#loop-slice-arrow)"/>
+        <rect x="30" y="140" width="240" height="56" rx="9" class="fill-accent-soft"/><text x="150" y="164" text-anchor="middle" class="label-strong">predicate producer p1</text><text x="150" y="184" text-anchor="middle" class="label-dim">b1의 결과를 무조건 계산</text>
+        <rect x="310" y="140" width="240" height="56" rx="9" class="fill-accent-soft"/><text x="430" y="164" text-anchor="middle" class="label-strong">predicate producer p2</text><text x="430" y="184" text-anchor="middle" class="label-dim">b2의 결과도 무조건 계산</text>
+        <rect x="590" y="140" width="240" height="56" rx="9" class="fill-accent-soft"/><text x="710" y="164" text-anchor="middle" class="label-strong">조건부 store s1</text><text x="710" y="184" text-anchor="middle" class="label-dim">p1, p2가 허락할 때만 효과</text>
+        <path d="M272 168 H304" class="stroke-accent" marker-end="url(#loop-slice-arrow-accent)"/><text x="290" y="158" text-anchor="middle" class="label-mono">p1</text>
+        <path d="M552 168 H584" class="stroke-accent" marker-end="url(#loop-slice-arrow-accent)"/><text x="570" y="158" text-anchor="middle" class="label-mono">p2</text>
+        <path d="M150 196 V230" class="stroke-line" marker-end="url(#loop-slice-arrow)"/>
+        <path d="M430 196 V230" class="stroke-line" marker-end="url(#loop-slice-arrow)"/>
+        <path d="M710 196 V230" class="stroke-line" marker-end="url(#loop-slice-arrow)"/>
+        <rect x="30" y="234" width="240" height="46" rx="9" class="fill-elevated"/><text x="150" y="262" text-anchor="middle" class="label">b1의 결과 queue</text>
+        <rect x="310" y="234" width="240" height="46" rx="9" class="fill-elevated"/><text x="430" y="262" text-anchor="middle" class="label">b2의 결과 queue</text>
+        <rect x="590" y="234" width="240" height="46" rx="9" class="fill-elevated"/><text x="710" y="262" text-anchor="middle" class="label">helper 전용 작은 cache</text>
+        <text x="20" y="312" class="label-dim">helper에 남는 제어 흐름은 loop 분기 하나뿐이다. helper 안에서는 분기를 예측하지 않는다.</text>
+      </svg>
+      <figcaption><b>그림 7-2.</b> predicate로 묶인 helper. 원문 Fig. 5의 구조를 이 장의 예제로 다시 그림. 세 사슬은 동시에 실행되고, 각 사슬의 마지막 명령만 자신을 가로막는 predicate를 기다린다.</figcaption>
+    </figure>
+    <p>논문의 구현에서 predicate register는 2 bit다. 한 bit는 이 명령 자체가 앞선 predicate에 의해 허락되었는지를, 다른 한 bit는 분기의 방향을 담는다. store는 자신을 직접 가로막는 predicate 하나만 입력으로 받는다. b2의 predicate가 다시 b1의 predicate를 입력으로 받으므로, 여러 겹으로 싸인 store도 바깥 조건을 모두 따르게 된다.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>p1 (b1의 결과)</th><th>p2 (b2의 결과)</th><th>main에서 b2</th><th>store s1</th></tr></thead>
+      <tbody>
+        <tr><td><span class="taken-text">taken</span></td><td>어느 값이든</td><td>실행하지 않는다. p2는 쓰이지 않는다.</td><td>억제</td></tr>
+        <tr><td><span class="not-taken-text">not-taken</span></td><td><span class="taken-text">taken</span></td><td>실행한다. p2를 예측으로 쓴다.</td><td>억제</td></tr>
+        <tr><td><span class="not-taken-text">not-taken</span></td><td><span class="not-taken-text">not-taken</span></td><td>실행한다. p2를 예측으로 쓴다.</td><td>효과를 낸다</td></tr>
+      </tbody>
+    </table></div>
+    <p>helper의 store가 프로그램의 실제 메모리를 바꾸는 것은 아니다. 논문의 설계에서 helper가 쓴 값은 helper 전용의 작은 cache(doubleword 32개)에만 들어가고, helper의 load가 그 값을 읽는다. main의 확정 상태는 건드리지 않는다.</p>
+    <p>아래 실험에서 위 루프를 한 반복씩 돌려 보자. 왼쪽은 main이 실제로 겪는 일, 오른쪽은 helper가 먼저 계산한 값이다.</p>
+
+    <div class="simulator" id="simulator-trace">
+      <div class="simulator-head"><span class="simulator-tag">실험 1</span><h3>얽힌 루프를 한 반복씩</h3></div>
+      <div class="simulator-body">
+        <div class="simulator-view">
+          <div class="legend"><span><i style="background:var(--taken)"></i>T: taken (건너뜀)</span><span><i style="background:var(--not-taken)"></i>N: not-taken</span><span><i style="background:var(--surface-strong)"></i>(괄호): 계산했지만 main이 쓰지 않는 값</span><span><i style="background:transparent; box-shadow: 0 0 0 2px var(--mispredict)"></i>✕ helper의 값이 실제와 다름</span></div>
+          <div class="table-wrap trace-table-wrap"><table class="trace-table" aria-label="반복별로 main이 겪은 일과 helper가 계산한 값">
+            <thead>
+              <tr><th rowspan="2">반복</th><th rowspan="2">칸</th><th colspan="4" class="group-heading">main이 실제로 겪은 일</th><th colspan="4" class="group-heading">helper가 먼저 계산한 값</th></tr>
+              <tr><th class="group-start" title="main이 읽은 visited[cell]">읽은 값</th><th>b1</th><th>b2</th><th>s1</th><th class="group-start" title="helper가 읽은 visited[cell]">읽은 값</th><th>p1</th><th>p2</th><th>s1</th></tr>
+            </thead>
+            <tbody id="trace-rows"></tbody>
+          </table></div>
+          <div class="step-narration" id="trace-narration" aria-live="polite"></div>
+        </div>
+        <div class="simulator-controls inline">
+          <div class="control"><span>helper의 store 처리</span><div class="segmented" id="trace-helper"><button data-value="predicated" class="on">조건부 store (Phelps)</button><button data-value="ignored">store를 무시하는 helper</button><button data-value="unconditional">store를 항상 적용</button></div></div>
+          <div class="control"><span>진행</span><div class="control-row"><button class="button primary" id="trace-step">한 반복</button><button class="button" id="trace-play">자동 실행</button><button class="button" id="trace-reset">처음부터</button></div></div>
+        </div>
+      </div>
+      <div class="simulator-readout">
+        <div class="statistic"><span class="statistic-label">지나간 반복</span><span class="statistic-value" id="trace-progress">—</span></div>
+        <div class="statistic"><span class="statistic-label">helper가 맞힌 b1</span><span class="statistic-value" id="trace-correct">—</span></div>
+        <div class="statistic"><span class="statistic-label">p1이 틀린 반복</span><span class="statistic-value" id="trace-wrong">—</span></div>
+        <div class="statistic"><span class="statistic-label">억제된 store (실제)</span><span class="statistic-value" id="trace-suppressed">—</span></div>
+      </div>
+      <div class="simulator-note"><b>설명용 모델.</b> 열 번의 반복이 칸 3, 7, 3, 5, 7, 5, 9, 3, 9, 5를 차례로 본다. 칸 5만 막혀 있다. helper는 main보다 앞서 달리므로 main의 store는 아직 메모리에 없다고 가정했다. 그래서 helper는 자기 store로 쓴 값만 다시 읽을 수 있다. <b>해 볼 것.</b> "store를 무시하는 helper"로 바꾸면 같은 칸을 다시 만나는 반복 3, 5, 8, 9에서 p1이 틀린다. "store를 항상 적용"으로 바꾸면 막힌 칸 5를 방문한 것으로 착각해 반복 6, 10에서 틀린다. 실제 Branch Runahead는 store를 빼는 대신 처음 본 의존을 고정으로 가정하며, 이 실험은 그 동작을 그대로 옮긴 것이 아니다.</div>
+    </div>
+    <p>세 방식의 차이는 "같은 칸을 다시 만났을 때 helper가 무엇을 읽는가"에서 갈린다. store를 빼면 helper는 과거를 잊는다. store를 조건 없이 넣으면 일어나지 않은 일을 기억한다. store를 넣되 predicate로 묶어야 main과 같은 값을 읽는다.</p>
+    <div class="callout evidence">
+      <strong>논문이 보고한 구성별 차이 (astar의 가중치가 가장 큰 SimPoint, 64KB TAGE-SC-L 기준 MPKI 29.5)</strong>
+      <p>b1, b2, s1을 모두 넣은 Phelps는 MPKI를 2.68로 줄였다. guarded store를 빼고 b1과 b2만 선행 실행하면 13.4, b1만 선행 실행하면 22.9였다. b2 없이 b1과 s1만 넣으면 24.5였는데, 논문은 b2가 막아야 할 store가 억제되지 않아 b1의 정확도가 오히려 나빠졌다고 설명한다.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ 3 -->
+  <section id="queues">
+    <h2>반복 단위로 맞추는 결과 queue</h2>
+    <p>helper가 b2를 매 반복 계산하면 새 문제가 생긴다. main은 b1이 taken인 반복에서 b2를 fetch하지도 않는다. helper가 만든 b2 결과가 main이 실제로 만나는 b2보다 <strong>더 많다</strong>. 남는 결과를 제대로 버리지 않으면, main은 다른 반복의 결과를 자기 것으로 착각한다.</p>
+    <p>Phelps의 답은 분기마다 queue를 하나씩 두고(<span class="term">per-branch prediction queue</span>), 모든 queue를 <strong>loop 반복에 맞춰 함께</strong> 움직이는 것이다. 논문은 이를 lock-step이라고 부른다. queue의 한 열이 한 반복에 대응한다.</p>
+    <ul>
+      <li><span class="term">tail</span>: helper가 결과를 넣는 열. helper가 loop 분기를 retire할 때 다음 열로 간다.</li>
+      <li><span class="term">spec head</span>: main이 예측을 꺼내는 열. main이 loop 분기를 fetch할 때 다음 열로 간다.</li>
+      <li><span class="term">head</span>: main이 loop 분기를 retire하면 그 열을 비운다.</li>
+    </ul>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 300" role="img" aria-label="분기별 prediction queue. 열은 loop 반복이고 head, spec head, tail 세 포인터가 열을 가리킨다">
+        <defs><marker id="loop-queue-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrow-head-accent"/></marker></defs>
+        <text x="20" y="132" class="label-strong">b1 queue</text>
+        <text x="20" y="204" class="label-strong">b2 queue</text>
+        <g class="label-dim" text-anchor="middle">
+          <text x="184" y="92">반복 1</text><text x="268" y="92">반복 2</text><text x="352" y="92">반복 3</text><text x="436" y="92">반복 4</text>
+          <text x="520" y="92">반복 5</text><text x="604" y="92">반복 6</text><text x="688" y="92">반복 7</text><text x="772" y="92">반복 8</text>
+        </g>
+        <text x="184" y="40" text-anchor="middle" class="label-accent">head</text><path d="M184 48 V74" class="stroke-accent" marker-end="url(#loop-queue-arrow)"/>
+        <text x="520" y="40" text-anchor="middle" class="label-accent">spec head</text><path d="M520 48 V74" class="stroke-accent" marker-end="url(#loop-queue-arrow)"/>
+        <text x="688" y="40" text-anchor="middle" class="label-accent">tail</text><path d="M688 48 V74" class="stroke-accent" marker-end="url(#loop-queue-arrow)"/>
+        <!-- b1 행 -->
+        <rect x="150" y="104" width="68" height="46" rx="8" class="fill-not-taken"/><text x="184" y="132" text-anchor="middle" class="label-on-color">N</text>
+        <rect x="234" y="104" width="68" height="46" rx="8" class="fill-not-taken"/><text x="268" y="132" text-anchor="middle" class="label-on-color">N</text>
+        <rect x="318" y="104" width="68" height="46" rx="8" class="fill-taken"/><text x="352" y="132" text-anchor="middle" class="label-on-color">T</text>
+        <rect x="402" y="104" width="68" height="46" rx="8" class="fill-not-taken"/><text x="436" y="132" text-anchor="middle" class="label-on-color">N</text>
+        <rect x="486" y="104" width="68" height="46" rx="8" class="fill-taken"/><text x="520" y="132" text-anchor="middle" class="label-on-color">T</text>
+        <rect x="570" y="104" width="68" height="46" rx="8" class="fill-not-taken"/><text x="604" y="132" text-anchor="middle" class="label-on-color">N</text>
+        <rect x="654" y="104" width="68" height="46" rx="8" class="fill-elevated" stroke-dasharray="5 4"/>
+        <rect x="738" y="104" width="68" height="46" rx="8" class="fill-elevated" stroke-dasharray="5 4"/>
+        <!-- b2 행 -->
+        <rect x="150" y="176" width="68" height="46" rx="8" class="fill-taken"/><text x="184" y="204" text-anchor="middle" class="label-on-color">T</text>
+        <rect x="234" y="176" width="68" height="46" rx="8" class="fill-not-taken"/><text x="268" y="204" text-anchor="middle" class="label-on-color">N</text>
+        <rect x="318" y="176" width="68" height="46" rx="8" class="fill-surface"/><text x="352" y="204" text-anchor="middle" class="label-mono">(N)</text>
+        <rect x="402" y="176" width="68" height="46" rx="8" class="fill-taken"/><text x="436" y="204" text-anchor="middle" class="label-on-color">T</text>
+        <rect x="486" y="176" width="68" height="46" rx="8" class="fill-surface"/><text x="520" y="204" text-anchor="middle" class="label-mono">(T)</text>
+        <rect x="570" y="176" width="68" height="46" rx="8" class="fill-not-taken"/><text x="604" y="204" text-anchor="middle" class="label-on-color">N</text>
+        <rect x="654" y="176" width="68" height="46" rx="8" class="fill-elevated" stroke-dasharray="5 4"/>
+        <rect x="738" y="176" width="68" height="46" rx="8" class="fill-elevated" stroke-dasharray="5 4"/>
+        <!-- 소비 경로: 반복 4는 b2까지, 반복 5는 b2를 건너 다음 열로 -->
+        <path d="M436 152 V172" class="stroke-accent" marker-end="url(#loop-queue-arrow)"/>
+        <path d="M556 127 H567" class="stroke-accent" marker-end="url(#loop-queue-arrow)"/>
+        <text x="20" y="256" class="label-dim">괄호 속 값: helper가 계산했지만, 같은 열의 b1이 taken이라 main이 쓰지 않는 b2 결과</text>
+        <text x="20" y="278" class="label-dim">반복 4는 b1이 not-taken이라 아래 b2 칸까지 쓴다. 반복 5는 b1이 taken이라 b2 칸을 두고 다음 열로 간다.</text>
+      </svg>
+      <figcaption><b>그림 7-3.</b> 반복 단위로 관리하는 분기별 queue. 원문 Fig. 4를 이 장의 두 분기로 줄여 다시 그림. 값은 설명을 위해 정한 것이다.</figcaption>
+    </figure>
+    <p>핵심은 <strong>쓰지 않는 결과도 자기 자리를 차지한다</strong>는 점이다. b1이 taken이면 main은 그 열의 b2 칸을 건드리지 않고 지나간다. 다음 반복에서 spec head가 한 열 옮겨 가므로, b2의 다음 결과는 다시 올바른 열에서 나온다. 따로 "이 결과는 버려라"라고 알려 줄 장치가 필요 없다.</p>
+
+    <div class="simulator" id="simulator-queue">
+      <div class="simulator-head"><span class="simulator-tag">실험 2</span><h3>반복 단위로 맞추는 결과 queue</h3></div>
+      <div class="simulator-body side">
+        <div class="simulator-view">
+          <div class="legend"><span><i style="background:var(--taken)"></i>T: taken</span><span><i style="background:var(--not-taken)"></i>N: not-taken</span><span><i style="background:var(--surface-strong)"></i>(괄호): 쓰지 않고 넘긴 결과</span><span><i style="background:transparent; box-shadow: 0 0 0 2px var(--mispredict)"></i>✕ 틀린 예측</span></div>
+          <canvas id="queue-canvas" data-height="218" aria-label="b1 queue와 b2 queue의 열별 상태, 그리고 main이 각 반복에서 쓴 b2 예측"></canvas>
+          <div class="step-narration" id="queue-narration" aria-live="polite"></div>
+        </div>
+        <div class="simulator-controls">
+          <div class="control"><span>b2 queue를 소비하는 방식</span><div class="segmented" id="queue-mode"><button data-value="lockstep" class="on">반복 단위로 정렬</button><button data-value="arrival">도착 순서대로</button></div></div>
+          <div class="control-row"><button class="button primary" id="queue-step">한 단계</button><button class="button" id="queue-play">자동 실행</button><button class="button" id="queue-reset">처음부터</button></div>
+        </div>
+      </div>
+      <div class="simulator-readout">
+        <div class="statistic"><span class="statistic-label">main이 지나간 반복</span><span class="statistic-value" id="queue-progress">—</span></div>
+        <div class="statistic"><span class="statistic-label">쓰지 않고 넘긴 b2 결과</span><span class="statistic-value" id="queue-skipped">—</span></div>
+        <div class="statistic"><span class="statistic-label">b2 queue의 어긋남</span><span class="statistic-value" id="queue-drift">—</span></div>
+        <div class="statistic"><span class="statistic-label">b2 오예측</span><span class="statistic-value" id="queue-mispredictions">—</span></div>
+      </div>
+      <div class="simulator-note"><b>설명용 모델.</b> 열두 번의 반복이고, helper는 main보다 네 반복 앞서 결과를 채운다. helper가 계산한 값은 모두 옳다고 가정했다. 아래 줄의 선은 main이 쓴 b2 예측이 queue의 어느 칸에서 나왔는지를 잇는다. <b>해 볼 것.</b> "도착 순서대로"로 바꾸고 끝까지 진행해 보자. b1이 처음 taken이 되는 반복 3부터 선이 비스듬해지고, 그 뒤로 main은 계속 앞 반복의 결과를 꺼낸다. 값이 우연히 같으면 맞고 다르면 틀린다.</div>
+    </div>
+    <p>복구도 단순해진다. main이 오예측이나 load 순서 위반으로 되돌아가면, spec head만 그 분기가 기억해 둔 위치로 되돌린다. helper는 영향을 받지 않고, 이미 계산해 둔 결과를 다시 꺼내 쓰면 된다. 논문은 한 가지 부수 효과도 짚는다. 드물게 helper가 b1을 taken으로 잘못 계산해 main이 b2 칸을 지나쳤더라도, b2의 결과는 그 열에 그대로 남아 있다. main이 not-taken 쪽으로 되돌아오면 두 번째에는 그 값을 쓴다.</p>
+  </section>
+
+  <!-- ============================================================ 4 -->
+  <section id="hardware">
+    <h2>helper를 만들고 돌리는 방법</h2>
+    <p>Phelps는 컴파일러나 프로그래머의 도움 없이 하드웨어만으로 helper를 만든다. 논문의 구현은 main이 400만 명령을 retire할 때마다 한 구간(<span class="term">epoch</span>)으로 본다. 한 epoch에서 어느 분기가 얼마나 틀리는지, 그 분기를 감싸는 루프가 어디인지 모으고, 다음 epoch에서 helper를 만들고, 그다음 epoch부터 쓴다.</p>
+    <ul>
+      <li><strong>대상 고르기.</strong> 오예측이 0.5 MPKI를 넘는 분기를 모아, 그 분기를 품은 루프를 찾는다.</li>
+      <li><strong>씨앗에서 키우기.</strong> 루프의 delinquent branch 전부와 loop 분기를 씨앗으로 삼는다. 루프가 여러 번 도는 동안, 씨앗에 값을 주는 명령, 그 명령에 값을 주는 명령을 차례로 더한다. helper에 든 load와 주소가 겹치는 store가 보이면 그 store와 계산 사슬도 넣는다.</li>
+      <li><strong>가로막는 관계 배우기.</strong> 각 분기와 store를 직접 가로막는 분기가 무엇인지, 어느 방향일 때 허락되는지를 반복을 관찰하며 배운다.</li>
+      <li><strong>중첩 루프.</strong> 안쪽 루프가 짧고 횟수를 예측하기 어려우면, 바깥 루프용 helper와 안쪽 루프용 helper를 따로 둔다. 바깥 helper가 안쪽 루프 방문을 queue에 쌓아 두면 안쪽 helper가 하나씩 처리한다.</li>
+    </ul>
+    <p>helper는 전용 코어에서 돌지 않는다. main이 쓰던 코어를 <strong>나눠 쓴다</strong>. helper가 도는 동안 frontend 폭과 순서를 지키는 구조들이 둘로 갈린다.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 256" role="img" aria-label="helper가 도는 동안 main과 helper가 코어 자원을 나누는 비율">
+        <text x="20" y="26" class="label-strong">helper가 도는 동안 코어 자원을 나누는 비율</text>
+        <text x="20" y="76" class="label">helper 하나</text><text x="20" y="94" class="label-dim">안쪽 루프만 있을 때</text>
+        <rect x="180" y="56" width="330" height="46" rx="8" class="fill-surface"/><text x="345" y="84" text-anchor="middle" class="label-strong">main thread 1/2</text>
+        <rect x="510" y="56" width="330" height="46" rx="8" class="fill-accent-soft"/><text x="675" y="84" text-anchor="middle" class="label-strong">helper thread 1/2</text>
+        <text x="20" y="142" class="label">helper 둘</text><text x="20" y="160" class="label-dim">바깥과 안쪽 루프</text>
+        <rect x="180" y="122" width="330" height="46" rx="8" class="fill-surface"/><text x="345" y="150" text-anchor="middle" class="label-strong">main thread 1/2</text>
+        <rect x="510" y="122" width="82" height="46" rx="8" class="fill-accent-soft"/><text x="551" y="150" text-anchor="middle" class="label-strong">바깥 1/8</text>
+        <rect x="592" y="122" width="248" height="46" rx="8" class="fill-accent-soft"/><text x="716" y="150" text-anchor="middle" class="label-strong">안쪽 루프 helper 3/8</text>
+        <text x="20" y="200" class="label">나누는 것: frontend 폭, ROB, PRF free list, load queue, store queue</text>
+        <text x="20" y="222" class="label">함께 쓰는 것: issue queue와 실행 장치</text>
+        <text x="20" y="244" class="label-dim">helper가 끝나면 pipeline을 비우고 모든 자원을 main에 돌려준다.</text>
+      </svg>
+      <figcaption><b>그림 7-4.</b> main과 helper의 자원 분할. 원문 Table I과 IV-A절의 설명을 그림으로 옮김.</figcaption>
+    </figure>
+    <p>나눠 쓰기 때문에 helper가 커지면 손해다. 논문은 세 가지 경우에 그 루프를 대상에서 뺀다. helper의 명령 수가 루프 명령 수의 75%를 넘을 때, 한 번 들어가서 도는 횟수가 적어 helper를 켜고 끄는 비용을 메우지 못할 때, 중첩 루프에서 바깥 helper가 안쪽 helper의 값에 의존할 때다.</p>
+    <p>새로 드는 저장 공간은 합쳐서 10.82KB다. 분기 통계를 모으는 표, helper 명령을 담는 cache(루프 4개, 루프당 명령 128개), 분기별 queue(16개, 각 32 반복), helper 전용 data cache, predicate register 등이 포함된다.</p>
+  </section>
+
+  <!-- ============================================================ 5 -->
+  <section id="results">
+    <h2>논문이 보고한 결과</h2>
+    <p>평가는 저자들의 RISC-V 실행 기반 cycle 수준 시뮬레이터에서 했다. 코어는 8-wide, ROB 632, fetch에서 retire까지 11단계이고, baseline 예측기는 64KB TAGE-SC-L이다. benchmark마다 1억 명령짜리 SimPoint를 최대 5개 골라 IPC의 가중 조화 평균을 냈다.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>항목</th><th style="text-align:right">논문이 보고한 값</th><th>조건</th></tr></thead>
+      <tbody>
+        <tr><td>bfs 전체 speedup</td><td class="number">+64%</td><td>GAP, roadNet-CA 입력</td></tr>
+        <tr><td>bc 전체 speedup</td><td class="number">+63%</td><td>GAP, roadNet-CA 입력</td></tr>
+        <tr><td>astar 전체 speedup</td><td class="number">+15%</td><td>SPEC2006 473.astar, rivers 입력, 모든 SimPoint 가중 평균</td></tr>
+        <tr><td>astar 최상위 SimPoint speedup</td><td class="number">+47%</td><td>가중치가 가장 큰 SimPoint 하나. 저자들이 다시 구현한 Branch Runahead(예측으로 사슬 시작)는 같은 구간에서 +29%</td></tr>
+        <tr><td>astar 최상위 SimPoint MPKI</td><td class="number">29.5 → 2.68</td><td>같은 SimPoint</td></tr>
+        <tr><td>MPKI 감소율</td><td class="number">72–91%</td><td>GAP과 astar 여섯 benchmark 가운데 네 개</td></tr>
+        <tr><td>helper가 더 실행한 명령</td><td class="number">평균 3,470만</td><td>main이 retire한 1억 명령당</td></tr>
+        <tr><td>자원 분할만의 비용</td><td class="number">4.1–12.8%</td><td>GAP과 astar에서 helper 없이 코어만 나눴을 때의 main 속도 저하. pr이 가장 작고 bc가 가장 크다</td></tr>
+        <tr><td>같은 비용, SPEC2017</td><td class="number">2–31%</td><td>perlbench가 가장 작고 exchange2가 가장 크다</td></tr>
+        <tr><td>추가 저장 공간</td><td class="number">10.82KB</td><td>원문 Table II의 합계</td></tr>
+      </tbody>
+    </table></div>
+    <p>astar의 전체 speedup(15%)이 최상위 SimPoint의 값(47%)보다 훨씬 작은 이유를 논문은 둘로 든다. 나머지 구간은 오예측이 그만큼 많지 않고, 그 구간의 루프는 한 번 들어가서 도는 횟수가 적어 helper를 쓸 수 없었다.</p>
+    <p>pipeline이 깊어지면 이득도 커진다. fetch에서 retire까지를 11, 15, 19단계로 늘리면 astar는 15%, 22%, 27%, bfs는 64%, 70%, 74%, bc는 63%, 71%, 79%로 올랐다고 보고한다. <a href="basics.html#penalty">1장</a>에서 본 대로 깊은 pipeline일수록 오예측 하나가 비싸기 때문이다.</p>
+    <div class="callout caution">
+      <strong>숫자를 읽을 때</strong>
+      <p>이 값들은 delinquent loop가 실행 시간의 큰 몫을 차지하는 그래프 처리와 astar에서 나왔다. 5장이나 8장 논문의 평균 speedup과 나란히 놓고 크기를 비교할 수 없다. workload 구성과 코어 모델이 다르다.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ 6 -->
+  <section id="limits">
+    <h2>언제 이득이고 언제 손해인가</h2>
+    <p>Phelps의 손익은 세 가지에 달려 있다. helper가 다룰 수 있는 루프가 실행 시간에서 얼마나 큰지, 그 안의 오예측을 얼마나 줄이는지, 그리고 자원을 나눠 쓰느라 main이 얼마나 느려지는지다. 아래 실험은 이 셋을 간단한 식으로 묶는다.</p>
+    <div class="formula">
+      $$ T_{\text{새}} = (1 - f) + f \left[ \frac{1 - \beta}{1 - c} + \beta\,(1 - r) \right] $$
+      $$ \text{speedup} = \frac{1}{T_{\text{새}}} - 1 $$
+      <div class="formula-note">\(f\): helper가 다루는 루프가 차지하는 실행 시간의 비율. \(\beta\): 그 루프 안에서 오예측 때문에 잃는 시간의 비율(이 실험에서는 50%로 고정). \(r\): 루프 안 오예측 감소율. \(c\): 자원을 나눠서 생기는 main의 속도 저하. Amdahl의 법칙처럼, 손대지 않은 부분 \((1-f)\)은 그대로 남는다.</div>
+    </div>
+
+    <div class="simulator" id="simulator-benefit">
+      <div class="simulator-head"><span class="simulator-tag">실험 3</span><h3>언제 이득이고 언제 손해인가</h3></div>
+      <div class="simulator-body side">
+        <div class="simulator-view">
+          <div class="legend"><span><i class="line" style="background:var(--series-1)"></i>현재 설정</span><span><i class="line" style="background:var(--series-2)"></i>분할 비용이 0일 때</span><span><i style="background:var(--mispredict-soft); box-shadow: 0 0 0 1px var(--mispredict)"></i>✕ 분할 비용이 이득보다 큰 구간</span></div>
+          <canvas id="benefit-canvas" data-height="310" aria-label="루프 안 오예측 감소율에 따른 전체 speedup 곡선과 손해 구간"></canvas>
+        </div>
+        <div class="simulator-controls">
+          <label class="control"><span>helper가 다루는 루프의 실행 시간 <output id="benefit-share-output"></output></span><input type="range" id="benefit-share" min="0" max="90" step="5" value="60"></label>
+          <label class="control"><span>루프 안 오예측 감소율 <output id="benefit-reduction-output"></output></span><input type="range" id="benefit-reduction" min="0" max="100" step="1" value="85"></label>
+          <label class="control"><span>자원 분할로 느려지는 정도 <output id="benefit-cost-output"></output></span><input type="range" id="benefit-cost" min="0" max="30" step="1" value="10"></label>
+        </div>
+      </div>
+      <div class="simulator-readout">
+        <div class="statistic"><span class="statistic-label">전체 speedup</span><span class="statistic-value" id="benefit-speedup">—</span></div>
+        <div class="statistic"><span class="statistic-label">손익이 같아지는 감소율</span><span class="statistic-value" id="benefit-break-even">—</span></div>
+        <div class="statistic"><span class="statistic-label">오예측을 못 줄이면</span><span class="statistic-value" id="benefit-worst">—</span></div>
+        <div class="statistic"><span class="statistic-label">분할 비용이 없다면</span><span class="statistic-value" id="benefit-free">—</span></div>
+      </div>
+      <div class="simulator-note"><b>설명용 모델.</b> 위의 Amdahl식 계산을 그대로 그린 것이며 논문의 측정 곡선이 아니다. 루프 안 시간의 절반이 오예측 손실이라고 가정했고, 자원 분할은 helper가 도는 동안에만 main을 느리게 한다고 보았다. helper를 켜고 끄는 비용과 helper가 늦게 도착하는 경우는 넣지 않았다. <b>해 볼 것.</b> 감소율을 20% 아래로 내리면 점이 붉은 구간으로 들어간다. 실행 시간 비율을 10%로 내리면 감소율이 높아도 곡선이 0 근처에 붙는다. 논문이 보고한 값은 위 절의 표에 따로 있다.</div>
+    </div>
+    <p>붉은 구간은 논문의 관찰과 같은 이야기를 한다. astar에서 b1만 선행 실행한 구성은 MPKI를 29.5에서 22.9로만 줄였고, 저자들은 이 정도로는 코어 자원의 절반을 내준 손해를 메우지 못한다고 적었다.</p>
+    <h3>SPEC2017 대부분에서 이득이 없는 이유</h3>
+    <p>논문은 SPEC2017 정수 benchmark에서 Phelps가 helper를 거의 또는 전혀 켜지 않았다고 보고하고, 남은 오예측을 원인별로 나눠 보인다.</p>
+    <ul>
+      <li><strong>애초에 몰려 있지 않다.</strong> mcf를 빼면 GAP이나 astar만큼 delinquent하지 않다. leela, deepsjeng, exchange2, xalancbmk는 오예측의 큰 몫이 개별로는 기준을 넘지 않는 분기들에서 나온다.</li>
+      <li><strong>루프 안에 있다고 보이지 않는다.</strong> mcf의 delinquent branch는 루프가 부르는 함수 안에 있다. 함수가 inline되지 않으면 분기의 주소가 루프의 주소 범위 밖에 놓여 대상에서 빠진다.</li>
+      <li><strong>helper가 너무 크다.</strong> leela, deepsjeng, omnetpp에서는 기준을 넘은 분기로 helper를 만들어도 루프의 75%를 넘는다.</li>
+      <li><strong>루프가 충분히 돌지 않는다.</strong> xz에서 delinquent branch가 만드는 오예측은 한 번 들어가 도는 횟수가 적은 루프에 있다.</li>
+      <li><strong>통계를 모을 자리가 모자란다.</strong> gcc는 분기 종류가 너무 많아 통계 표에서 자주 밀려난다.</li>
+    </ul>
+    <p>그 밖의 비용도 있다. 자원 분할은 helper가 도는 내내 치르는 값이고, 학습에 epoch 두 개(800만 명령)가 지나야 helper를 쓸 수 있다. helper는 main이 할 일의 일부를 한 번 더 실행한다. 논문은 이 추가 실행의 에너지를 보고하지 않았다.</p>
+  </section>
+
+  <section id="summary" class="keypoints">
+    <h2>핵심 정리</h2>
+    <ol>
+      <li>루프 안에서는 어려운 분기가 다른 어려운 분기의 실행 여부를 정하고, 그 분기들이 막는 store가 뒤 반복의 분기 결과를 바꿀 수 있다. helper가 앞의 분기를 다시 예측하면 병목이 helper로 옮겨 갈 뿐이다.</li>
+      <li>Phelps는 helper 안의 delinquent branch를 predicate producer로 바꿔 매 반복 무조건 계산한다. helper에 남는 제어 흐름은 loop 분기뿐이라 예측도 되돌리기도 없다.</li>
+      <li>분기에 제어 의존하는 store는 helper에 넣되 predicate로 묶는다. 빼면 과거를 잊고, 조건 없이 넣으면 일어나지 않은 일을 기억한다.</li>
+      <li>분기별 결과 queue는 loop 반복에 맞춰 함께 움직인다. b1이 taken이면 그 열의 b2 결과를 쓰지 않고 넘기므로, 남는 결과가 정렬을 깨지 않는다.</li>
+      <li>논문은 64KB TAGE-SC-L, 8-wide 코어에서 bfs +64%, bc +63%, astar +15%를 보고한다. 추가 저장 공간은 10.82KB다.</li>
+      <li>helper는 코어 자원을 main과 나눠 쓴다. 다룰 수 있는 루프가 작거나 오예측을 조금만 줄이면 분할 비용이 이득을 넘는다. SPEC2017 대부분에서는 helper가 켜지지 않았다.</li>
+    </ol>
+  </section>
+
+  <section id="quiz">
+    <h2>확인 퀴즈</h2>
+    <div class="quiz" id="chapter-quiz"></div>
+  </section>
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  /**
+   * 한 단계 / 자동 실행 / 처음부터 버튼을 묶는다. 두 실험이 같은 방식으로 진행되므로 한곳에 둔다.
+   * options: simulatorId, stepButtonId, playButtonId, resetButtonId, canAdvance(), advance(), reset(), stepSeconds
+   */
+  function createStepper(options) {
+    const playButton = document.getElementById(options.playButtonId);
+    const stepButton = document.getElementById(options.stepButtonId);
+    let secondsSinceLastStep = 0;
+    function refreshButtons() {
+      playButton.textContent = automaticRun.isPlaying ? "멈춤" : "자동 실행";
+      stepButton.disabled = !options.canAdvance();
+    }
+    function stopAutomaticRun() {
+      automaticRun.pause();
+      refreshButtons();
+    }
+    function stepOnce() {
+      if (!options.canAdvance()) { stopAutomaticRun(); return; }
+      options.advance();
+      if (!options.canAdvance()) stopAutomaticRun();
+      refreshButtons();
+    }
+    const automaticRun = BranchBook.createAnimationLoop(options.simulatorId, (deltaSeconds) => {
+      secondsSinceLastStep += deltaSeconds;
+      if (secondsSinceLastStep < options.stepSeconds) return;
+      secondsSinceLastStep = 0;
+      stepOnce();
+    }, { autoStart: false });
+    BranchBook.bindButton(options.stepButtonId, () => { stopAutomaticRun(); stepOnce(); });
+    BranchBook.bindButton(options.playButtonId, () => {
+      if (automaticRun.isPlaying) { stopAutomaticRun(); return; }
+      // 끝까지 간 상태에서 자동 실행을 누르면 처음부터 다시 보여 준다.
+      if (!options.canAdvance()) options.reset();
+      secondsSinceLastStep = 0;
+      automaticRun.play();
+      refreshButtons();
+    });
+    BranchBook.bindButton(options.resetButtonId, () => { stopAutomaticRun(); options.reset(); refreshButtons(); });
+    refreshButtons();
+    return { refreshButtons };
+  }
+
+  /* ============================================================ 실험 1: 얽힌 루프를 한 반복씩 */
+  (function setupTraceExperiment() {
+    const CELL_SEQUENCE = [3, 7, 3, 5, 7, 5, 9, 3, 9, 5];
+    const BLOCKED_CELLS = [5];
+    const INITIAL_REVEALED_COUNT = 4;
+    const AUTOMATIC_STEP_SECONDS = 1.2;
+    const VISITED_VALUE = 1;
+    const UNVISITED_VALUE = 0;
+    let revealedCount = INITIAL_REVEALED_COUNT;
+
+    /** 선택한 helper 방식으로 열 번의 반복을 모두 계산한다. main의 메모리와 helper의 메모리를 따로 둔다. */
+    function simulate(helperMode) {
+      const mainVisited = new Map();
+      const helperVisited = new Map();
+      const helperStoreIteration = new Map();
+      return CELL_SEQUENCE.map((cell, iterationIndex) => {
+        const isBlocked = BLOCKED_CELLS.includes(cell);
+        const mainLoadedValue = mainVisited.has(cell) ? VISITED_VALUE : UNVISITED_VALUE;
+        const isGuardingTaken = mainLoadedValue === VISITED_VALUE;
+        const isGuardedTaken = isBlocked;
+        const isMainStoreExecuted = !isGuardingTaken && !isGuardedTaken;
+        if (isMainStoreExecuted) mainVisited.set(cell, VISITED_VALUE);
+
+        const helperLoadedValue = helperVisited.has(cell) ? VISITED_VALUE : UNVISITED_VALUE;
+        const isGuardingPredicateTaken = helperLoadedValue === VISITED_VALUE;
+        const isGuardedPredicateTaken = isBlocked;
+        let isHelperStoreApplied = false;
+        if (helperMode === "predicated") isHelperStoreApplied = !isGuardingPredicateTaken && !isGuardedPredicateTaken;
+        if (helperMode === "unconditional") isHelperStoreApplied = true;
+        const earlierHelperStoreIteration = helperStoreIteration.get(cell) || 0;
+        if (isHelperStoreApplied && !helperVisited.has(cell)) {
+          helperVisited.set(cell, VISITED_VALUE);
+          helperStoreIteration.set(cell, iterationIndex + 1);
+        }
+        return {
+          iterationNumber: iterationIndex + 1, cell, isBlocked,
+          mainLoadedValue, isGuardingTaken, isGuardedTaken, isMainStoreExecuted,
+          helperLoadedValue, isGuardingPredicateTaken, isGuardedPredicateTaken, isHelperStoreApplied,
+          earlierHelperStoreIteration,
+          isPredicateWrong: isGuardingPredicateTaken !== isGuardingTaken,
+        };
+      });
+    }
+    function chipHtml(isTaken, options = {}) {
+      const letter = isTaken ? "T" : "N";
+      if (options.isBracketed) return '<span class="outcome-cell bracketed" title="계산했지만 main이 쓰지 않는 값">(' + letter + ")</span>";
+      let className = "outcome-cell " + (isTaken ? "taken" : "not-taken");
+      if (options.isWrong) className += " mispredicted";
+      return '<span class="' + className + '">' + letter + "</span>";
+    }
+    function storeText(isEffective) {
+      return isEffective ? "실행" : "억제";
+    }
+    function rowHtml(row, isRevealed, isCurrent) {
+      const leading = "<td>" + row.iterationNumber + '</td><td class="value-cell">' + row.cell + "</td>";
+      if (!isRevealed) {
+        return '<tr class="pending-row">' + leading + '<td class="group-start">·</td><td>·</td><td>·</td><td>·</td><td class="group-start">·</td><td>·</td><td>·</td><td>·</td></tr>';
+      }
+      const guardedCell = row.isGuardingTaken ? "—" : chipHtml(row.isGuardedTaken);
+      const helperStoreCell = helperControl.value === "ignored" ? "없음" : storeText(row.isHelperStoreApplied);
+      return '<tr class="' + (isCurrent ? "current-row" : "") + '">' + leading +
+        '<td class="group-start value-cell">' + row.mainLoadedValue + "</td>" +
+        "<td>" + chipHtml(row.isGuardingTaken) + "</td>" +
+        "<td>" + guardedCell + "</td>" +
+        "<td>" + storeText(row.isMainStoreExecuted) + "</td>" +
+        '<td class="group-start value-cell">' + row.helperLoadedValue + "</td>" +
+        "<td>" + chipHtml(row.isGuardingPredicateTaken, { isWrong: row.isPredicateWrong }) + "</td>" +
+        "<td>" + chipHtml(row.isGuardedPredicateTaken, { isBracketed: row.isGuardingPredicateTaken }) + "</td>" +
+        "<td>" + helperStoreCell + "</td></tr>";
+    }
+    function describeMain(row) {
+      if (row.isGuardingTaken) return "main은 visited[" + row.cell + "]에서 1을 읽어 b1이 taken이다. b2와 store는 실행하지 않는다.";
+      if (row.isGuardedTaken) return "main에서 b1은 not-taken이지만 칸이 막혀 있어 b2가 taken이다. store는 실행되지 않으므로 이 칸은 다음에 와도 방문 전이다.";
+      return "main에서 두 분기가 모두 not-taken이라 store가 visited[" + row.cell + "]에 1을 쓴다.";
+    }
+    function describeHelper(row) {
+      if (!row.isPredicateWrong) {
+        if (row.isGuardingPredicateTaken) return "helper도 자기 store로 써 둔 1을 읽어 p1을 맞혔다. p2는 계산했지만 main이 쓰지 않는다.";
+        return "helper의 p1과 p2는 실제와 같다.";
+      }
+      if (helperControl.value === "ignored") return "helper는 store를 빼 버려서 이 칸을 여전히 0으로 읽었다. p1이 틀렸다(✕).";
+      return "helper는 반복 " + row.earlierHelperStoreIteration + "에서 store를 조건 없이 적용해 이 칸을 1로 읽었다. 실제로는 b2가 그 store를 막았다. p1이 틀렸다(✕).";
+    }
+    function refresh() {
+      const rows = simulate(helperControl.value);
+      document.getElementById("trace-rows").innerHTML = rows.map((row, rowIndex) => rowHtml(row, rowIndex < revealedCount, rowIndex === revealedCount - 1)).join("");
+      const revealedRows = rows.slice(0, revealedCount);
+      const wrongRows = revealedRows.filter((row) => row.isPredicateWrong);
+      const suppressedCount = revealedRows.filter((row) => !row.isMainStoreExecuted).length;
+      BranchBook.setContent("trace-progress", revealedCount + "<small>/ " + rows.length + "</small>");
+      BranchBook.setContent("trace-correct", revealedCount === 0 ? "—" : (revealedCount - wrongRows.length) + "<small>/ " + revealedCount + "</small>");
+      BranchBook.setContent("trace-wrong", wrongRows.length === 0 ? "없음" : wrongRows.map((row) => row.iterationNumber).join(", "));
+      BranchBook.setContent("trace-suppressed", suppressedCount + "<small>번</small>");
+      let narration = "아직 아무 반복도 지나지 않았다. 모든 칸은 방문 전(0)이다. \"한 반복\"을 눌러 시작하자.";
+      if (revealedCount > 0) {
+        const currentRow = rows[revealedCount - 1];
+        narration = "<b>반복 " + currentRow.iterationNumber + ", 칸 " + currentRow.cell + ".</b> " + describeMain(currentRow) + " " + describeHelper(currentRow);
+      }
+      BranchBook.setContent("trace-narration", narration);
+    }
+    const helperControl = BranchBook.bindSegmented("trace-helper", refresh);
+    createStepper({
+      simulatorId: "simulator-trace", stepButtonId: "trace-step", playButtonId: "trace-play", resetButtonId: "trace-reset",
+      stepSeconds: AUTOMATIC_STEP_SECONDS,
+      canAdvance: () => revealedCount < CELL_SEQUENCE.length,
+      advance: () => { revealedCount++; refresh(); },
+      reset: () => { revealedCount = 0; refresh(); },
+    });
+    refresh();
+  })();
+
+  /* ============================================================ 실험 2: 반복 단위 queue */
+  (function setupQueueExperiment() {
+    // true는 taken이다. b2의 값은 helper가 매 반복 계산한 결과이며, b1이 taken인 반복에서는 main이 쓰지 않는다.
+    const GUARDING_OUTCOMES = [false, false, true, false, false, true, false, false, true, false, false, false];
+    const GUARDED_OUTCOMES = [false, true, true, false, true, false, false, true, true, false, true, false];
+    const ITERATION_COUNT = GUARDING_OUTCOMES.length;
+    const HELPER_LEAD_ITERATIONS = 4;
+    const INITIAL_CONSUMED_COUNT = 5;
+    const AUTOMATIC_STEP_SECONDS = 1.0;
+    const NARROW_CANVAS_WIDTH = 440;
+    const MAXIMUM_CHIP_SIZE = 30;
+    const NARROW_CANVAS_HEIGHT = 190;
+    const WIDE_CANVAS_HEIGHT = 218;
+    let consumedCount = INITIAL_CONSUMED_COUNT;
+    let layout = null;
+
+    function isLockStep() {
+      return modeControl.value === "lockstep";
+    }
+    function depositedCount() {
+      return Math.min(ITERATION_COUNT, consumedCount + HELPER_LEAD_ITERATIONS);
+    }
+    /** main이 지나간 각 반복에서 b2 예측을 어느 칸에서 꺼냈는지 계산한다. */
+    function computeUses() {
+      const uses = [];
+      // 도착 순서 방식에서는 b2 queue가 그냥 줄이다. main이 b2를 fetch할 때마다 맨 앞 칸을 꺼낸다.
+      let arrivalCursor = 0;
+      for (let iterationIndex = 0; iterationIndex < consumedCount; iterationIndex++) {
+        if (GUARDING_OUTCOMES[iterationIndex]) {
+          uses.push({ isGuardedFetched: false, sourceIndex: -1, isMispredicted: false });
+          continue;
+        }
+        const sourceIndex = isLockStep() ? iterationIndex : arrivalCursor;
+        arrivalCursor++;
+        const isPredictedTaken = GUARDED_OUTCOMES[sourceIndex];
+        uses.push({
+          isGuardedFetched: true, sourceIndex, isPredictedTaken,
+          isMispredicted: isPredictedTaken !== GUARDED_OUTCOMES[iterationIndex],
+        });
+      }
+      return uses;
+    }
+    function directionLetter(isTaken) {
+      return isTaken ? "T" : "N";
+    }
+    function describeLastStep(uses) {
+      if (consumedCount === 0) return "helper가 먼저 달려 네 반복의 결과를 채워 두었다. \"한 단계\"를 눌러 main이 소비하게 하자.";
+      const iterationIndex = consumedCount - 1;
+      const use = uses[iterationIndex];
+      const prefix = "<b>반복 " + consumedCount + ".</b> ";
+      const skippedSoFar = uses.filter((candidate) => !candidate.isGuardedFetched).length;
+      if (!use.isGuardedFetched && isLockStep()) return prefix + "b1이 taken이다. main은 b2를 fetch하지 않으므로 같은 열의 b2 결과를 쓰지 않고 넘긴다. 두 queue는 loop 분기에서 함께 다음 열로 간다.";
+      if (!use.isGuardedFetched) return prefix + "b1이 taken이라 main은 b2를 fetch하지 않는다. 그런데 helper가 넣어 둔 이 반복의 b2 결과는 줄 앞쪽에 그대로 남는다. 이제 b2 queue는 " + skippedSoFar + "칸 밀려 있다.";
+      const usedLetter = directionLetter(use.isPredictedTaken);
+      if (isLockStep()) return prefix + "b1이 not-taken이다. 같은 열의 b2 결과 " + usedLetter + "를 예측으로 쓴다. 실제와 같다.";
+      const sourceText = "b2를 fetch하면서 줄 맨 앞의 결과 " + usedLetter + "를 꺼냈다. 이 값은 반복 " + (use.sourceIndex + 1) + "의 것이다. ";
+      if (use.sourceIndex === iterationIndex) return prefix + sourceText + "아직 밀리지 않아 실제와 같다.";
+      if (use.isMispredicted) return prefix + sourceText + "실제 결과는 " + directionLetter(GUARDED_OUTCOMES[iterationIndex]) + "라서 오예측이다(✕).";
+      return prefix + sourceText + "다른 반복의 값이지만 우연히 같아서 맞았다.";
+    }
+    function refresh() {
+      const uses = computeUses();
+      const guardingTakenCount = uses.filter((use) => !use.isGuardedFetched).length;
+      const mispredictionCount = uses.filter((use) => use.isMispredicted).length;
+      BranchBook.setContent("queue-progress", consumedCount + "<small>/ " + ITERATION_COUNT + "</small>");
+      BranchBook.setContent("queue-skipped", (isLockStep() ? guardingTakenCount : 0) + "<small>개</small>");
+      BranchBook.setContent("queue-drift", (isLockStep() ? 0 : guardingTakenCount) + "<small>칸</small>");
+      BranchBook.setContent("queue-mispredictions", mispredictionCount + "<small>번</small>");
+      BranchBook.setContent("queue-narration", describeLastStep(uses));
+      queueCanvas.redraw();
+    }
+    function drawChip(context, palette, centerX, centerY, chipSize, isTaken, style) {
+      const letter = directionLetter(isTaken);
+      context.fillStyle = isTaken ? palette.taken : palette.notTaken;
+      if (style === "bracketed") context.fillStyle = palette.surfaceStrong;
+      BranchBook.roundedRectangle(context, centerX - chipSize / 2, centerY - chipSize / 2, chipSize, chipSize, 6);
+      context.fill();
+      context.fillStyle = style === "bracketed" ? palette.textDim : "#ffffff";
+      context.font = "600 " + (chipSize < 22 ? 10 : 12) + "px " + palette.mono;
+      context.textAlign = "center"; context.textBaseline = "middle";
+      context.fillText(style === "bracketed" ? "(" + letter + ")" : letter, centerX, centerY + 0.5);
+      if (style === "wrong") {
+        context.strokeStyle = palette.mispredict; context.lineWidth = 2;
+        BranchBook.roundedRectangle(context, centerX - chipSize / 2 - 3, centerY - chipSize / 2 - 3, chipSize + 6, chipSize + 6, 8);
+        context.stroke();
+        context.fillStyle = palette.mispredict; context.font = "700 11px " + palette.font;
+        context.fillText("✕", centerX + chipSize / 2 + 1, centerY - chipSize / 2 - 4);
+      }
+    }
+    function drawEmptySlot(context, palette, centerX, centerY, chipSize) {
+      context.strokeStyle = palette.border; context.lineWidth = 1.2; context.setLineDash([3, 3]);
+      BranchBook.roundedRectangle(context, centerX - chipSize / 2, centerY - chipSize / 2, chipSize, chipSize, 6);
+      context.stroke();
+      context.setLineDash([]);
+    }
+    // 캔버스가 만들어지자마자 한 번 그리므로, 그림이 읽는 선택 버튼을 먼저 묶어 둔다.
+    const modeControl = BranchBook.bindSegmented("queue-mode", refresh);
+    const queueCanvas = BranchBook.createCanvas("queue-canvas", (context, width, height, palette) => {
+      const isNarrow = width < NARROW_CANVAS_WIDTH;
+      const labelWidth = isNarrow ? 34 : 104;
+      const cellWidth = (width - labelWidth - 6) / ITERATION_COUNT;
+      const chipSize = Math.min(MAXIMUM_CHIP_SIZE, cellWidth - 5);
+      const pointerRowHeight = 40;
+      const headerY = pointerRowHeight + 10;
+      const guardingRowY = headerY + 16 + chipSize / 2;
+      const guardedRowY = guardingRowY + chipSize + 10;
+      const useRowY = guardedRowY + chipSize + 40;
+      const columnCenter = (iterationIndex) => labelWidth + (iterationIndex + 0.5) * cellWidth;
+      const uses = computeUses();
+      const deposited = depositedCount();
+      layout = { labelWidth, cellWidth, guardingRowY, guardedRowY, useRowY, chipSize };
+
+      // main이 지금 소비할 열을 옅게 칠해 두 queue가 같은 열을 본다는 점을 드러낸다.
+      if (consumedCount < ITERATION_COUNT) {
+        context.fillStyle = palette.accentSoft;
+        BranchBook.roundedRectangle(context, columnCenter(consumedCount) - cellWidth / 2 + 1, guardingRowY - chipSize / 2 - 5, cellWidth - 2, 2 * chipSize + 20, 6);
+        context.fill();
+      }
+      // 포인터 표시: 두 줄로 나눠 같은 열을 가리켜도 글자가 겹치지 않게 한다.
+      context.font = "600 11.5px " + palette.font; context.textBaseline = "middle"; context.textAlign = "center";
+      const pointerHalfWidth = 46;
+      if (deposited < ITERATION_COUNT) {
+        context.fillStyle = palette.textDim;
+        context.fillText("helper가 채울 열 ▼", BranchBook.clamp(columnCenter(deposited), pointerHalfWidth + 8, width - pointerHalfWidth - 8), 10);
+      } else {
+        context.fillStyle = palette.textDim; context.textAlign = "right";
+        context.fillText("helper는 끝까지 채웠다", width - 4, 10);
+        context.textAlign = "center";
+      }
+      context.fillStyle = palette.accent;
+      if (consumedCount < ITERATION_COUNT) {
+        context.fillText("main이 꺼낼 열 ▼", BranchBook.clamp(columnCenter(consumedCount), pointerHalfWidth + 2, width - pointerHalfWidth - 2), 28);
+      } else {
+        context.textAlign = "right";
+        context.fillText("main도 끝까지 갔다", width - 4, 28);
+      }
+      // 열 번호와 줄 이름
+      context.font = "11px " + palette.mono; context.fillStyle = palette.textDim; context.textAlign = "center";
+      for (let iterationIndex = 0; iterationIndex < ITERATION_COUNT; iterationIndex++) context.fillText(String(iterationIndex + 1), columnCenter(iterationIndex), headerY);
+      context.font = "12px " + palette.font; context.fillStyle = palette.text; context.textAlign = "left";
+      context.fillText(isNarrow ? "b1" : "b1 queue", 2, guardingRowY);
+      context.fillText(isNarrow ? "b2" : "b2 queue", 2, guardedRowY);
+      context.fillText(isNarrow ? "사용" : "main이 쓴 b2", 2, useRowY);
+      context.fillStyle = palette.textDim; context.font = "11px " + palette.font;
+      if (!isNarrow) context.fillText("반복", 2, headerY);
+
+      for (let iterationIndex = 0; iterationIndex < ITERATION_COUNT; iterationIndex++) {
+        const centerX = columnCenter(iterationIndex);
+        if (iterationIndex >= deposited) {
+          drawEmptySlot(context, palette, centerX, guardingRowY, chipSize);
+          drawEmptySlot(context, palette, centerX, guardedRowY, chipSize);
+          continue;
+        }
+        drawChip(context, palette, centerX, guardingRowY, chipSize, GUARDING_OUTCOMES[iterationIndex], "plain");
+        const isSkippedInPlace = isLockStep() && iterationIndex < consumedCount && GUARDING_OUTCOMES[iterationIndex];
+        drawChip(context, palette, centerX, guardedRowY, chipSize, GUARDED_OUTCOMES[iterationIndex], isSkippedInPlace ? "bracketed" : "plain");
+      }
+      // main이 쓴 예측과, 그 값이 나온 칸을 잇는 선
+      uses.forEach((use, iterationIndex) => {
+        const centerX = columnCenter(iterationIndex);
+        if (!use.isGuardedFetched) {
+          context.fillStyle = palette.textFaint; context.font = "12px " + palette.mono; context.textAlign = "center"; context.textBaseline = "middle";
+          context.fillText("—", centerX, useRowY);
+          return;
+        }
+        context.strokeStyle = use.isMispredicted ? palette.mispredict : palette.axis;
+        context.lineWidth = 1.5;
+        context.beginPath();
+        context.moveTo(columnCenter(use.sourceIndex), guardedRowY + chipSize / 2 + 3);
+        context.lineTo(centerX, useRowY - chipSize / 2 - 5);
+        context.stroke();
+        drawChip(context, palette, centerX, useRowY, chipSize, use.isPredictedTaken, use.isMispredicted ? "wrong" : "plain");
+      });
+    }, { heightForWidth: (width) => (width < NARROW_CANVAS_WIDTH ? NARROW_CANVAS_HEIGHT : WIDE_CANVAS_HEIGHT) });
+    BranchBook.attachTooltip("queue-canvas", (x, y) => {
+      if (!layout || x < layout.labelWidth) return null;
+      const iterationIndex = Math.floor((x - layout.labelWidth) / layout.cellWidth);
+      if (iterationIndex < 0 || iterationIndex >= ITERATION_COUNT) return null;
+      if (y < layout.guardingRowY - layout.chipSize || y > layout.useRowY + layout.chipSize) return null;
+      let html = "반복 <b>" + (iterationIndex + 1) + "</b>";
+      if (iterationIndex >= depositedCount()) return { x, y: layout.guardingRowY - layout.chipSize / 2, html: html + " · helper가 아직 채우지 않았다" };
+      html += " · b1 <b>" + directionLetter(GUARDING_OUTCOMES[iterationIndex]) + "</b> · helper가 계산한 b2 <b>" + directionLetter(GUARDED_OUTCOMES[iterationIndex]) + "</b>";
+      const use = computeUses()[iterationIndex];
+      if (use && use.isGuardedFetched) html += " · main이 쓴 예측 <b>" + directionLetter(use.isPredictedTaken) + "</b> (반복 " + (use.sourceIndex + 1) + "의 칸)";
+      if (use && !use.isGuardedFetched) html += " · main은 b2를 fetch하지 않음";
+      return { x, y: layout.guardingRowY - layout.chipSize / 2, html };
+    });
+    createStepper({
+      simulatorId: "simulator-queue", stepButtonId: "queue-step", playButtonId: "queue-play", resetButtonId: "queue-reset",
+      stepSeconds: AUTOMATIC_STEP_SECONDS,
+      canAdvance: () => consumedCount < ITERATION_COUNT,
+      advance: () => { consumedCount++; refresh(); },
+      reset: () => { consumedCount = 0; refresh(); },
+    });
+    refresh();
+  })();
+
+  /* ============================================================ 실험 3: 이득과 분할 비용 */
+  (function setupBenefitExperiment() {
+    // 루프 안에서 오예측 때문에 잃는 시간의 비율. 슬라이더를 셋으로 줄이려고 고정했다.
+    const MISPREDICTION_TIME_SHARE_INSIDE_LOOP = 0.5;
+    const PERCENT = 100;
+    const CHART_MINIMUM_SPEEDUP = -20;
+    const CHART_MAXIMUM_SPEEDUP = 100;
+    const CURVE_STEP_PERCENT = 1;
+
+    /** 위 식 그대로: 손대지 않은 부분 + (나눠 쓰느라 느려진 부분 + 줄어든 오예측 손실) */
+    function speedupPercent(loopShare, reduction, partitionCost) {
+      const usefulTime = (1 - MISPREDICTION_TIME_SHARE_INSIDE_LOOP) / (1 - partitionCost);
+      const mispredictionTime = MISPREDICTION_TIME_SHARE_INSIDE_LOOP * (1 - reduction);
+      const newTime = (1 - loopShare) + loopShare * (usefulTime + mispredictionTime);
+      return (1 / newTime - 1) * PERCENT;
+    }
+    /** 분할 비용과 이득이 정확히 같아지는 오예측 감소율(0~1). 1을 넘으면 어떤 감소율로도 이득이 안 난다. */
+    function breakEvenReduction(partitionCost) {
+      const usefulShare = 1 - MISPREDICTION_TIME_SHARE_INSIDE_LOOP;
+      return (usefulShare / MISPREDICTION_TIME_SHARE_INSIDE_LOOP) * (partitionCost / (1 - partitionCost));
+    }
+    function formatSigned(value) {
+      return (value >= 0 ? "+" : "−") + Math.abs(value).toFixed(1) + "%";
+    }
+    function currentSettings() {
+      return { loopShare: shareControl.value / PERCENT, reduction: reductionControl.value / PERCENT, partitionCost: costControl.value / PERCENT };
+    }
+    function refresh() {
+      const settings = currentSettings();
+      const breakEven = breakEvenReduction(settings.partitionCost);
+      BranchBook.setContent("benefit-speedup", formatSigned(speedupPercent(settings.loopShare, settings.reduction, settings.partitionCost)));
+      BranchBook.setContent("benefit-break-even", breakEven > 1 ? "도달 불가" : BranchBook.formatPercent(breakEven, 0));
+      BranchBook.setContent("benefit-worst", formatSigned(speedupPercent(settings.loopShare, 0, settings.partitionCost)));
+      BranchBook.setContent("benefit-free", formatSigned(speedupPercent(settings.loopShare, settings.reduction, 0)));
+      benefitCanvas.redraw();
+    }
+    const shareControl = BranchBook.bindRange("benefit-share", (value) => value + "%", refresh);
+    const reductionControl = BranchBook.bindRange("benefit-reduction", (value) => value + "%", refresh);
+    const costControl = BranchBook.bindRange("benefit-cost", (value) => value + "%", refresh);
+    let lastChart = null;
+    const benefitCanvas = BranchBook.createCanvas("benefit-canvas", (context, width, height, palette) => {
+      const settings = currentSettings();
+      const chart = BranchBook.drawChart(context, { x: 56, y: 14, width: width - 74, height: height - 62 }, {
+        xMinimum: 0, xMaximum: PERCENT, yMinimum: CHART_MINIMUM_SPEEDUP, yMaximum: CHART_MAXIMUM_SPEEDUP,
+        xTicks: 5, yTicks: 6, xLabel: "루프 안 오예측 감소율 (%)", yLabel: "전체 speedup (%)",
+        xFormat: (value) => value.toFixed(0), yFormat: (value) => value.toFixed(0),
+      });
+      lastChart = chart;
+      // 손해 구간: 감소율이 손익분기보다 낮은 범위에서 0 아래쪽을 칠한다.
+      const breakEvenPercent = Math.min(PERCENT, breakEvenReduction(settings.partitionCost) * PERCENT);
+      if (breakEvenPercent > 0 && settings.loopShare > 0) {
+        const regionLeft = chart.toX(0);
+        const regionRight = chart.toX(breakEvenPercent);
+        const zeroY = chart.toY(0);
+        const bottomY = chart.toY(CHART_MINIMUM_SPEEDUP);
+        context.fillStyle = palette.mispredictSoft;
+        context.fillRect(regionLeft, zeroY, regionRight - regionLeft, bottomY - zeroY);
+        context.strokeStyle = palette.mispredict; context.lineWidth = 1.5; context.setLineDash([4, 4]);
+        context.beginPath(); context.moveTo(regionRight, chart.bounds.y); context.lineTo(regionRight, bottomY); context.stroke();
+        context.setLineDash([]);
+        context.fillStyle = palette.mispredict; context.font = "600 12px " + palette.font; context.textBaseline = "middle";
+        const isLabelInside = regionRight - regionLeft > 70;
+        context.textAlign = "left";
+        context.fillText("✕ 손해", isLabelInside ? regionLeft + 8 : regionRight + 6, (zeroY + bottomY) / 2);
+      }
+      // 0% 기준선을 눈에 띄게 다시 긋는다.
+      context.strokeStyle = palette.axis; context.lineWidth = 1.2;
+      context.beginPath(); context.moveTo(chart.bounds.x, chart.toY(0)); context.lineTo(chart.bounds.x + chart.bounds.width, chart.toY(0)); context.stroke();
+      const currentCurve = [];
+      const freeCurve = [];
+      for (let reductionPercent = 0; reductionPercent <= PERCENT; reductionPercent += CURVE_STEP_PERCENT) {
+        currentCurve.push([reductionPercent, speedupPercent(settings.loopShare, reductionPercent / PERCENT, settings.partitionCost)]);
+        freeCurve.push([reductionPercent, speedupPercent(settings.loopShare, reductionPercent / PERCENT, 0)]);
+      }
+      BranchBook.drawLine(context, chart, freeCurve, palette.series[1], { dashed: true });
+      BranchBook.drawLine(context, chart, currentCurve, palette.series[0]);
+      const markerX = chart.toX(settings.reduction * PERCENT);
+      const markerY = chart.toY(speedupPercent(settings.loopShare, settings.reduction, settings.partitionCost));
+      context.fillStyle = palette.series[0]; context.strokeStyle = palette.background; context.lineWidth = 2;
+      context.beginPath(); context.arc(markerX, markerY, 6, 0, Math.PI * 2); context.fill(); context.stroke();
+      const isMarkerNearRightEdge = markerX > width - 110;
+      context.fillStyle = palette.text; context.font = "600 12px " + palette.font;
+      context.textAlign = isMarkerNearRightEdge ? "right" : "left"; context.textBaseline = "bottom";
+      context.fillText("현재 위치", markerX + (isMarkerNearRightEdge ? -10 : 10), markerY - 6);
+    });
+    BranchBook.attachTooltip("benefit-canvas", (x) => {
+      if (!lastChart) return null;
+      const bounds = lastChart.bounds;
+      if (x < bounds.x || x > bounds.x + bounds.width) return null;
+      const settings = currentSettings();
+      const reduction = (x - bounds.x) / bounds.width;
+      const netSpeedup = speedupPercent(settings.loopShare, reduction, settings.partitionCost);
+      const freeSpeedup = speedupPercent(settings.loopShare, reduction, 0);
+      return { x, y: lastChart.toY(netSpeedup), html: "감소율 <b>" + BranchBook.formatPercent(reduction, 0) + "</b> → speedup <b>" + formatSigned(netSpeedup) + "</b> · 분할 비용이 없으면 <b>" + formatSigned(freeSpeedup) + "</b>" };
+    });
+    refresh();
+  })();
+
+  /* ============================================================ 퀴즈 */
+  BranchBook.renderQuiz("chapter-quiz", [
+    {
+      question: "b2가 b1에 제어 의존하고 둘 다 예측하기 어렵다. helper 안에서 b1을 예측해 b2의 선행 실행 여부를 정하는 방식의 문제는?",
+      options: ["helper가 b2를 너무 일찍 계산한다", "b1의 예측이 틀릴 때마다 helper가 되돌아가야 해서, 오예측 병목이 main에서 helper로 옮겨 갈 뿐이다", "b1의 결과 queue가 넘친다", "b2가 loop 분기가 되어 버린다"],
+      answerIndex: 1,
+      explanation: "b1은 바로 그 예측하기 어려운 분기다. helper가 b1을 예측하면 helper가 자주 틀리고 되돌아간다. Phelps는 b1의 방향과 무관하게 b2를 매 반복 계산해 이 예측을 없앤다.",
+    },
+    {
+      question: "Phelps의 helper에서 분기에 제어 의존하는 store를 predicate로 묶는 이유는?",
+      options: ["store가 느려서 미리 실행해야 하기 때문이다", "helper에는 분기 흐름이 없으므로, 묶지 않으면 store가 매 반복 실행되어 뒤 반복의 load가 틀린 값을 읽기 때문이다", "store를 main의 메모리에 바로 반영하기 위해서다", "predicate register가 남기 때문이다"],
+      answerIndex: 1,
+      explanation: "분기를 predicate producer로 바꾸면 helper에서 '건너뛰기'가 사라진다. store의 효과를 조건값으로 막아야 실제 프로그램과 같은 메모리 상태를 따라간다. helper의 store는 전용 cache에만 쓰인다.",
+    },
+    {
+      question: "반복 단위 queue에서, 어떤 반복의 b1 예측이 taken이었다. main은 그 반복의 b2 결과를 어떻게 하는가?",
+      options: ["다음 반복의 b2 예측으로 쓴다", "쓰지 않고 그 열에 둔 채, loop 분기에서 두 queue가 함께 다음 열로 넘어간다", "helper에게 다시 계산하라고 알린다", "b1 queue의 다음 칸과 바꾼다"],
+      answerIndex: 1,
+      explanation: "쓰지 않는 결과도 자기 반복의 열을 차지한다. spec head가 열 단위로 움직이므로, 다음 반복의 b2 결과는 다시 올바른 열에서 나온다. 도착 순서대로 꺼내면 실험 2처럼 한 칸씩 밀린다.",
+    },
+    {
+      question: "실험 3에서 '루프 안 오예측 감소율'이 손익이 같아지는 값보다 낮으면 어떤 일이 생기는가?",
+      options: ["speedup이 0에 머문다", "자원을 나눠 쓰는 비용이 오예측 감소의 이득보다 커서 전체가 느려진다", "helper가 자동으로 꺼진다", "MPKI가 늘어난다"],
+      answerIndex: 1,
+      explanation: "helper가 도는 동안 main은 frontend와 ROB 등의 절반만 쓴다. 논문도 astar에서 b1만 선행 실행한 구성은 MPKI를 29.5에서 22.9로만 줄여 이 손해를 메우지 못했다고 적었다.",
+    },
+    {
+      question: "논문이 SPEC2017 정수 benchmark 대부분에서 Phelps의 이득이 없다고 보고한 이유로 <b>맞지 않는</b> 것은?",
+      options: ["오예측이 소수의 delinquent branch에 몰려 있지 않은 경우가 많다", "helper가 루프의 75%를 넘어 대상에서 빠진다", "delinquent branch가 inline되지 않은 함수 안에 있어 루프 범위 밖으로 보인다", "64KB TAGE-SC-L이 SPEC2017의 모든 분기를 이미 완벽하게 예측한다"],
+      answerIndex: 3,
+      explanation: "앞의 셋은 논문이 든 이유다. SPEC2017에도 오예측은 남아 있다. 다만 Phelps가 다루는 형태, 곧 충분히 오래 도는 루프 안의 소수 분기가 아닌 경우가 많다.",
+    },
+  ]);
+})();
+</script>
+</body>
+</html>

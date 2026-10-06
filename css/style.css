@@ -292,6 +292,7 @@ svg .arrow-head-accent { fill: var(--accent); }
 .simulator-controls.inline { flex-direction: row; flex-wrap: wrap; align-items: flex-end; gap: 14px 22px; }
 .simulator-controls.inline .control { flex: 1 1 180px; }
 .control { display: flex; flex-direction: column; gap: 6px; font-size: 14px; color: var(--text-dim); }
+.control[hidden] { display: none; }
 .control > span { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
 .control output { font-family: var(--mono); font-size: 13px; color: var(--text); font-weight: 600; white-space: nowrap; }
 .control select { height: 36px; border-radius: 8px; border: 1px solid var(--border); background: var(--elevated); color: var(--text); font: inherit; font-size: 14px; padding: 0 8px; }
