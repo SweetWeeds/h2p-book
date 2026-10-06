@@ -25,7 +25,6 @@ css/style.css       공통 스타일
 js/common.js        레이아웃, 실험 도우미, 축소 예측기(bimodal, gshare, TAGE)
 js/papers.js        논문 자료(종합 장과 참고문헌이 함께 사용)
 js/state.js         6장 실험 5개와 퀴즈
-js/latency.js       9장 실험 3개와 퀴즈
 ```
 
 로컬에서 보려면 이 폴더에서 `python3 -m http.server`를 실행하고 브라우저로 엽니다.

@@ -26,9 +26,33 @@
 <h2>정확도만 높이면 충분할까</h2>
 <p><a href="history.html">2장</a>의 TAGE는 여러 길이의 history로 표를 찾고, tag를 비교하고, 예측을 고른다. 표가 커지면 더 많은 패턴을 기억할 수 있지만 읽는 시간이 길어질 수 있다. 한 cycle에 다음 fetch 주소를 골라야 하는 frontend에서 수 cycle짜리 조회를 그대로 기다리면 명령 공급이 끊긴다.</p>
 <p>한 가지 해법은 작고 빠른 예측기와 크고 정확한 예측기를 함께 쓰는 것이다. 먼저 빠른 답으로 진행하고, 늦게 온 답이 다르면 경로를 바꾼다(<span class="term">override</span>). 두 답이 다를 때마다 그동안의 fetch를 되돌리는 비용이 생긴다. 이는 분기를 실제로 실행한 뒤 발견하는 오예측 복구와는 다른 사건이다. 큰 예측기의 답도 나중에 틀린 것으로 드러날 수 있다.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 300" role="img" aria-label="빠른 예측기의 답으로 먼저 진행하다가 늦게 나온 정확한 답이 다르면 그 사이 가져온 명령을 버리는 과정">
+<defs><marker id="latency-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrow-head"/></marker></defs>
+<text x="150" y="30" text-anchor="middle" class="label-mono">cycle 0</text>
+<text x="300" y="30" text-anchor="middle" class="label-mono">cycle 1</text>
+<text x="450" y="30" text-anchor="middle" class="label-mono">cycle 2</text>
+<text x="600" y="30" text-anchor="middle" class="label-mono">cycle 3</text>
+<text x="750" y="30" text-anchor="middle" class="label-mono">cycle 4</text>
+<path d="M225 20 V44 M375 20 V44 M525 20 V44 M675 20 V44" class="stroke-dashed"/>
+<text x="20" y="80" class="label-strong">빠른 예측기</text>
+<rect x="85" y="92" width="130" height="38" rx="8" class="fill-accent-soft"/><text x="150" y="116" text-anchor="middle" class="label">조회</text>
+<rect x="235" y="92" width="130" height="38" rx="8" class="fill-taken"/><text x="300" y="116" text-anchor="middle" class="label-on-color">답: T</text>
+<text x="20" y="160" class="label-strong">정확한 예측기</text>
+<rect x="85" y="172" width="430" height="38" rx="8" class="fill-accent-soft"/><text x="300" y="196" text-anchor="middle" class="label">표가 커서 3 cycle 동안 조회</text>
+<rect x="535" y="172" width="130" height="38" rx="8" class="fill-not-taken"/><text x="600" y="196" text-anchor="middle" class="label-on-color">답: N</text>
+<text x="20" y="240" class="label-strong">Fetch</text>
+<rect x="235" y="250" width="130" height="34" rx="8" class="fill-mispredict-soft"/><text x="300" y="272" text-anchor="middle" class="label">T 경로 ✕</text>
+<rect x="385" y="250" width="130" height="34" rx="8" class="fill-mispredict-soft"/><text x="450" y="272" text-anchor="middle" class="label">T 경로 ✕</text>
+<rect x="535" y="250" width="130" height="34" rx="8" class="fill-mispredict-soft"/><text x="600" y="272" text-anchor="middle" class="label">T 경로 ✕</text>
+<rect x="685" y="250" width="150" height="34" rx="8" class="fill-not-taken-soft"/><text x="760" y="272" text-anchor="middle" class="label">N 경로로 다시</text>
+<path d="M600 212 V244" class="stroke-mispredict" marker-end="url(#latency-arrow)"/>
+</svg>
+<figcaption><b>그림 9-1.</b> 두 예측기의 답이 다를 때. 빠른 답(T)으로 가져온 세 cycle 분량의 명령은 정확한 답(N)이 나오는 순간 버려진다. 분기를 실행해서 드러나는 오예측과는 별개로 생기는 손실이다. 설명용 그림이며 cycle 수는 예시다.</figcaption>
+</figure>
 <div class="simulator" id="simulator-timing">
 <div class="simulator-head"><span class="simulator-tag">실험 1</span><h3>조회를 몇 cycle 앞당길까</h3></div>
-<div class="simulator-body side"><div class="simulator-view"><canvas id="timing-canvas" data-height="300" aria-label="일반 조회와 선행 조회의 시작, 도착, 필요한 시각 비교"></canvas></div>
+<div class="simulator-body side"><div class="simulator-view"><div class="legend"><span><i style="background:var(--series-1)"></i>일반 조회</span><span><i style="background:var(--series-2)"></i>선행 조회</span><span><i style="background:var(--mispredict-soft); box-shadow: inset 0 0 0 1.5px var(--mispredict)"></i>✕ 답이 늦은 구간</span></div><canvas id="timing-canvas" data-height="270" aria-label="일반 조회와 선행 조회의 시작, 도착, 필요한 시각 비교"></canvas></div>
 <div class="simulator-controls">
 <label class="control"><span>조회 지연 <output id="timing-latency-output"></output></span><input type="range" id="timing-latency" min="1" max="6" value="3"></label>
 <label class="control"><span>앞당기는 시간 <output id="timing-lead-output"></output></span><input type="range" id="timing-lead" min="0" max="6" value="3"></label>
@@ -47,11 +71,72 @@
 <h2>Ahead Prediction: 필요한 순간에는 고르기만 한다</h2>
 <div class="paper-card"><span class="paper-title">Enabling Ahead Prediction with Practical Energy Constraints</span><span class="paper-meta">Lingzhe (Chester) Cai, Aniket Deshmukh, Yale Patt · ISCA 2025 · <a href="https://hps.ece.utexas.edu/pub/cai_ahead.pdf" rel="noopener">원문</a></span><span class="paper-scope">근거 범위: 논문 전문 · SPEC CPU2017, 16-wide OoO, ROB 512, 3-cycle overriding TAGE 기준</span></div>
 <p>현재 시점의 PC와 history로 <strong>미래의 분기를 위한 조회</strong>를 시작한다. 이때의 입력을 ahead PC, ahead history라 부른다. 조회가 진행되는 동안 중간 분기들이 지나가고, 목표 분기의 답이 필요할 때에는 그 중간 경로에 맞는 후보를 선택한다.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 330" role="img" aria-label="Ahead Prediction의 흐름: 분기 0에서 조회를 시작하고, 중간 분기가 지나가는 동안 후보를 준비해 queue에 넣고, 분기 N에서 secondary tag로 하나를 고른다">
+<defs><marker id="ahead-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrow-head"/></marker></defs>
+<text x="20" y="28" class="label-strong">프로그램이 지나가는 분기</text>
+<rect x="20" y="42" width="96" height="44" rx="10" class="fill-accent-soft"/><text x="68" y="69" text-anchor="middle" class="label-strong">분기 0</text>
+<rect x="160" y="42" width="78" height="44" rx="10" class="fill-surface"/><text x="199" y="69" text-anchor="middle" class="label">분기 1</text>
+<rect x="258" y="42" width="78" height="44" rx="10" class="fill-surface"/><text x="297" y="69" text-anchor="middle" class="label">분기 2</text>
+<rect x="356" y="42" width="78" height="44" rx="10" class="fill-surface"/><text x="395" y="69" text-anchor="middle" class="label">분기 3</text>
+<rect x="454" y="42" width="78" height="44" rx="10" class="fill-surface"/><text x="493" y="69" text-anchor="middle" class="label">분기 4</text>
+<rect x="576" y="42" width="110" height="44" rx="10" class="fill-accent-soft"/><text x="631" y="69" text-anchor="middle" class="label-strong">분기 N (5)</text>
+<path d="M120 64 H154 M240 64 H254 M338 64 H352 M436 64 H450 M534 64 H570" class="stroke-line" marker-end="url(#ahead-arrow)"/>
+<path d="M160 100 V108 H532 V100" class="stroke-dashed"/>
+<text x="346" y="126" text-anchor="middle" class="label-accent">조회를 시작할 때는 모르는 구간 = missing history</text>
+
+<path d="M68 90 V172" class="stroke-accent" marker-end="url(#ahead-arrow)"/>
+<rect x="20" y="176" width="210" height="70" rx="10" class="fill-elevated"/>
+<text x="125" y="202" text-anchor="middle" class="label-strong">선행 조회 시작</text>
+<text x="125" y="224" text-anchor="middle" class="label-dim">분기 0의 PC와 history로</text>
+<path d="M234 211 H276" class="stroke-line" marker-end="url(#ahead-arrow)"/>
+<rect x="280" y="176" width="200" height="70" rx="10" class="fill-elevated"/>
+<text x="380" y="202" text-anchor="middle" class="label-strong">후보 여러 개 생성</text>
+<text x="380" y="224" text-anchor="middle" class="label-dim">secondary tag 값마다 하나</text>
+<path d="M484 211 H526" class="stroke-line" marker-end="url(#ahead-arrow)"/>
+<rect x="530" y="176" width="150" height="70" rx="10" class="fill-elevated"/>
+<text x="605" y="202" text-anchor="middle" class="label-strong">Prediction queue</text>
+<text x="605" y="224" text-anchor="middle" class="label-dim">후보를 보관</text>
+<path d="M684 211 H726" class="stroke-line" marker-end="url(#ahead-arrow)"/>
+<rect x="730" y="176" width="130" height="70" rx="10" class="fill-taken-soft"/>
+<text x="795" y="202" text-anchor="middle" class="label-strong">하나를 선택</text>
+<text x="795" y="224" text-anchor="middle" class="label-dim">분기 N의 예측</text>
+<path d="M631 90 V132 H795 V172" class="stroke-accent" marker-end="url(#ahead-arrow)"/>
+<text x="716" y="150" text-anchor="middle" class="label-dim">드러난 중간 경로로 고른다</text>
+<text x="20" y="286" class="label-dim">시간이 걸리는 표 조회는 왼쪽에서 미리 끝낸다.</text>
+<text x="20" y="308" class="label-dim">분기 N에 도착했을 때 남은 일은 준비된 후보 가운데 하나를 고르는 것뿐이다.</text>
+</svg>
+<figcaption><b>그림 9-2.</b> Ahead Prediction의 흐름. 원문 Fig. 9(prediction pipeline)의 설명을 바탕으로 단순화해 다시 그렸다. 논문의 설계는 다섯 분기 앞에서 조회를 시작한다.</figcaption>
+</figure>
 <p>문제는 조회 시작과 목표 분기 사이의 <span class="term">missing history</span>다. 중간에 조건부 분기가 N개라면 방향만으로도 최대 2<sup>N</sup>가지 조합이 있다. 후보마다 표를 따로 읽으면 분기를 더 많이 건너뛸수록 읽는 양이 폭증한다. 다섯 분기는 32가지다.</p>
 <div class="callout"><strong>수학적으로 가능한 경로와 실제로 나타나는 경로</strong><p>논문의 분석에서는 다섯 분기를 건너뛰었을 때 문맥의 71%가 중간 경로 한 가지만 보였다. 네 가지를 넘는 경로가 관찰된 문맥은 약 1%였다. 중간 분기 대부분이 그 문맥에서 잘 예측되기 때문이다. 이 관찰은 모든 프로그램에서 보장되는 성질은 아니다.</p></div>
+<figure class="diagram">
+<svg viewBox="0 0 860 300" role="img" aria-label="중간 분기 세 개가 만드는 여덟 갈래 가운데 실제로 지나간 두 갈래">
+<text x="20" y="28" class="label-strong">중간 분기 세 개가 만드는 갈래</text>
+<g class="stroke-dashed">
+<path d="M90 160 L250 90 M90 160 L250 230"/>
+<path d="M250 90 L430 55 M250 90 L430 125 M250 230 L430 195 M250 230 L430 265"/>
+<path d="M430 55 L610 38 M430 55 L610 72 M430 125 L610 108 M430 125 L610 142 M430 195 L610 178 M430 195 L610 212 M430 265 L610 248 M430 265 L610 282"/>
+</g>
+<path d="M90 160 L250 90 L430 125 L610 108" class="stroke-taken" style="stroke-width:4"/>
+<path d="M430 125 L610 142" class="stroke-not-taken" style="stroke-width:4"/>
+<circle cx="90" cy="160" r="9" class="fill-accent"/>
+<circle cx="250" cy="90" r="7" class="fill-accent"/><circle cx="250" cy="230" r="7" class="fill-surface"/>
+<circle cx="430" cy="55" r="7" class="fill-surface"/><circle cx="430" cy="125" r="7" class="fill-accent"/><circle cx="430" cy="195" r="7" class="fill-surface"/><circle cx="430" cy="265" r="7" class="fill-surface"/>
+<text x="90" y="192" text-anchor="middle" class="label-dim">조회 시작</text>
+<text x="250" y="284" text-anchor="middle" class="label-mono">분기 1</text>
+<text x="430" y="296" text-anchor="middle" class="label-mono">분기 2</text>
+<text x="610" y="20" text-anchor="middle" class="label-mono">분기 3</text>
+<text x="628" y="112" class="label-strong">자주 지나가는 경로</text>
+<text x="628" y="146" class="label">가끔 지나가는 경로</text>
+<text x="628" y="216" class="label-dim">나머지 여섯 갈래는</text>
+<text x="628" y="236" class="label-dim">이 문맥에서 나타나지 않는다</text>
+</svg>
+<figcaption><b>그림 9-3.</b> 가능한 갈래와 실제로 지나가는 갈래. 분기 세 개면 여덟 갈래가 가능하지만, 중간 분기가 잘 예측되는 문맥에서는 한두 갈래만 나타난다. 설명용 그림이다.</figcaption>
+</figure>
 <div class="simulator" id="simulator-patterns">
 <div class="simulator-head"><span class="simulator-tag">실험 2</span><h3>가능한 경로와 관찰한 경로</h3></div>
-<div class="simulator-body side"><div class="simulator-view"><canvas id="patterns-canvas" data-height="300" aria-label="가능한 방향 조합 중 실제 표본에 나타난 조합과 빈도"></canvas></div><div class="simulator-controls">
+<div class="simulator-body side"><div class="simulator-view"><div class="legend"><span><i style="background:var(--accent)"></i>관찰된 방향 조합 (숫자는 방문 횟수)</span><span><i style="background:var(--surface-strong)"></i>한 번도 나타나지 않은 조합</span></div><canvas id="patterns-canvas" data-height="300" aria-label="가능한 방향 조합 중 실제 표본에 나타난 조합과 빈도"></canvas></div><div class="simulator-controls">
 <label class="control"><span>건너뛰는 분기 N <output id="patterns-distance-output"></output></span><input type="range" id="patterns-distance" min="1" max="8" value="5"></label>
 <label class="control"><span>그중 무작위인 분기 <output id="patterns-random-output"></output></span><input type="range" id="patterns-random" min="0" max="5" value="1"></label>
 </div></div>
@@ -59,8 +144,9 @@
 <div class="statistic"><span class="statistic-label">가능한 방향 조합</span><span class="statistic-value" id="patterns-possible">—</span></div>
 <div class="statistic"><span class="statistic-label">512회에서 관찰한 조합</span><span class="statistic-value" id="patterns-observed">—</span></div>
 <div class="statistic"><span class="statistic-label">관찰한 조합 / 가능한 조합</span><span class="statistic-value" id="patterns-share">—</span></div>
+<div class="statistic"><span class="statistic-label">표마다 읽는 entry: 전부 펼칠 때 / secondary tag</span><span class="statistic-value" id="patterns-reads">—</span></div>
 </div>
-<div class="simulator-note"><b>설명용 표본.</b> 같은 ahead 문맥을 512회 방문한다. 고정 분기의 방향은 항상 같고, 무작위 분기는 독립적인 50:50 방향이다. 난수 씨앗은 고정했다. 칸 하나가 방향 조합 하나이며 채워진 칸은 관찰된 조합, 숫자는 방문 횟수다(칸이 작으면 숫자를 생략한다). 조합 수의 비율은 에너지 비율이 아니다. <b>해 볼 것.</b> N = 5에서 무작위 분기를 0, 1, 5로 바꾸면 왜 희소성이 중요한지 보인다.</div>
+<div class="simulator-note"><b>설명용 표본.</b> 같은 ahead 문맥을 512회 방문한다. 고정 분기의 방향은 항상 같고, 무작위 분기는 독립적인 50:50 방향이다. 난수 씨앗은 고정했다. 칸 하나가 방향 조합 하나이며 채워진 칸은 관찰된 조합, 숫자는 방문 횟수다(칸이 작으면 숫자를 생략한다). 칸에 마우스를 올리면 그 조합의 방향열이 보인다. 조합 수의 비율은 에너지 비율이 아니다. <b>해 볼 것.</b> N = 5에서 무작위 분기를 0, 1, 5로 바꾸면 왜 희소성이 중요한지 보인다.</div>
 </div>
 <h3>두 종류의 tag</h3>
 <p>논문은 서로 다른 missing history의 entry를 서로 다른 TAGE 표에 분산하고, 각 entry에 <span class="term">secondary tag</span>를 붙인다. 표마다 읽는 entry는 기존 TAGE처럼 하나다. Primary tag는 조회를 시작한 앞쪽 문맥이 맞는지 확인한다. Secondary tag는 그 뒤에 나타난 중간 경로가 맞는지 확인한다.</p>
@@ -69,7 +155,8 @@
 <div class="simulator-head"><span class="simulator-tag">실험 3</span><h3>같은 앞쪽 문맥, 다른 중간 경로</h3></div>
 <div class="simulator-body"><div class="simulator-controls">
 <div class="control"><span>목표 분기에 도달하면서 알게 된 missing history</span><div class="segmented" id="tags-history"><button data-value="00" class="on">NN · 00</button><button data-value="01">NT · 01</button><button data-value="10">TN · 10</button><button data-value="11">TT · 11</button></div></div>
-<label class="check"><input type="checkbox" id="tags-primary">앞쪽 문맥도 바꾸기 (primary tag 불일치)</label>
+<label class="check"><input type="checkbox" id="tags-primary"> 앞쪽 문맥도 바꾸기 (primary tag 불일치)</label>
+<div class="control"><span>드러난 중간 분기 두 개의 방향</span><div id="tags-strip"></div></div>
 </div><div class="table-wrap"><table><thead><tr><th>표</th><th>History 길이</th><th>Primary</th><th>Secondary</th><th>예측</th><th>판정</th></tr></thead><tbody id="tags-rows"></tbody></table></div></div>
 <div class="simulator-readout"><div class="statistic"><span class="statistic-label">선택된 provider</span><span class="statistic-value" id="tags-provider">—</span></div><div class="statistic"><span class="statistic-label">최종 예측</span><span class="statistic-value" id="tags-result">—</span></div></div>
 <div class="simulator-note"><b>설명용 표.</b> 두 분기의 방향을 그대로 2-bit tag로 쓰고, 표 다섯 개와 가장 긴 history 우선 규칙만 보인다. 표의 숫자는 만든 예이며 학습·할당·alternate predictor는 생략했다. 실제 논문은 방향만 이어 붙이지 않고 중간 분기의 target 정보를 hash하므로 indirect branch도 구분하고 tag 폭과 ahead distance를 분리한다. <b>해 볼 것.</b> 11에서는 primary가 틀린 T4를 제외하고 T3을 고른다. 10에서는 T0로 돌아간다.</div>
@@ -98,6 +185,256 @@
 </ol></section>
 <section id="quiz"><h2>확인 퀴즈</h2><div class="quiz" id="chapter-quiz"></div></section>
 </main>
-<script src="../js/latency.js"></script>
+<script>
+(function () {
+  "use strict";
+
+  /* ============================================================ 실험 1: 조회를 몇 cycle 앞당길까
+     요청 시점을 t = 0, 빠른 답을 쓰는 시점을 t = 1로 둔다. 정확한 답이 t = 1보다 늦게 오면
+     그 차이만큼의 fetch를 되돌려야 한다. */
+  (function setupTimingExperiment() {
+    const ANSWER_NEEDED_CYCLE = 1;
+    const AXIS_MINIMUM_CYCLE = -6;
+    const AXIS_MAXIMUM_CYCLE = 7;
+    const LOOKUPS_PER_HUNDRED = 100;
+    const BAR_HEIGHT = 30;
+
+    function remainingDelay(latency, lead) {
+      return Math.max(0, latency - lead - ANSWER_NEEDED_CYCLE);
+    }
+    function refresh() {
+      const latency = latencyControl.value;
+      const lead = leadControl.value;
+      const disagreementCount = (disagreementControl.value / 100) * LOOKUPS_PER_HUNDRED;
+      BranchBook.setContent("timing-remaining", remainingDelay(latency, lead) + " cycle");
+      BranchBook.setContent("timing-baseline", disagreementCount * remainingDelay(latency, 0) + " cycle");
+      BranchBook.setContent("timing-ahead", disagreementCount * remainingDelay(latency, lead) + " cycle");
+      timingCanvas.redraw();
+    }
+    const latencyControl = BranchBook.bindRange("timing-latency", (value) => value + " cycle", refresh);
+    const leadControl = BranchBook.bindRange("timing-lead", (value) => value + " cycle", refresh);
+    const disagreementControl = BranchBook.bindRange("timing-disagreement", (value) => value + "%", refresh);
+    let barRegions = [];
+
+    const timingCanvas = BranchBook.createCanvas("timing-canvas", (context, width, height, palette) => {
+      const latency = latencyControl.value;
+      const lead = leadControl.value;
+      const plotLeft = 16;
+      const plotRight = width - 16;
+      const axisY = height - 46;
+      const toX = (cycle) => plotLeft + ((cycle - AXIS_MINIMUM_CYCLE) / (AXIS_MAXIMUM_CYCLE - AXIS_MINIMUM_CYCLE)) * (plotRight - plotLeft);
+      const rows = [
+        { label: "일반 조회: 요청과 함께 시작", start: 0, color: palette.series[0], top: 36 },
+        { label: "선행 조회: " + lead + " cycle 먼저 시작", start: -lead, color: palette.series[1], top: 116 },
+      ];
+      barRegions = [];
+
+      context.strokeStyle = palette.grid; context.lineWidth = 1;
+      context.fillStyle = palette.textDim; context.font = "11px " + palette.mono; context.textAlign = "center"; context.textBaseline = "top";
+      for (let cycle = AXIS_MINIMUM_CYCLE; cycle <= AXIS_MAXIMUM_CYCLE; cycle++) {
+        const x = Math.round(toX(cycle)) + 0.5;
+        context.beginPath(); context.moveTo(x, 18); context.lineTo(x, axisY); context.stroke();
+        if (cycle % 2 === 0 || width > 480) context.fillText(String(cycle), x, axisY + 6);
+      }
+      context.font = "12px " + palette.font;
+      context.fillText("cycle (요청 시점 = 0)", (plotLeft + plotRight) / 2, axisY + 24);
+
+      rows.forEach((row) => {
+        const finish = row.start + latency;
+        const lateCycles = Math.max(0, finish - ANSWER_NEEDED_CYCLE);
+        context.fillStyle = palette.text; context.font = "12px " + palette.font; context.textAlign = "left"; context.textBaseline = "alphabetic";
+        context.fillText(row.label, plotLeft, row.top - 6);
+        context.fillStyle = row.color;
+        BranchBook.roundedRectangle(context, toX(row.start), row.top, toX(finish) - toX(row.start), BAR_HEIGHT, 5);
+        context.fill();
+        if (lateCycles > 0) {
+          // 답이 필요한 시점을 넘긴 부분은 버려질 수 있는 fetch 구간이다.
+          const lateLeft = toX(ANSWER_NEEDED_CYCLE);
+          const lateWidth = toX(finish) - lateLeft;
+          context.fillStyle = palette.mispredictSoft;
+          context.fillRect(lateLeft, row.top + BAR_HEIGHT + 4, lateWidth, 14);
+          context.strokeStyle = palette.mispredict; context.lineWidth = 1.5;
+          context.strokeRect(lateLeft, row.top + BAR_HEIGHT + 4, lateWidth, 14);
+        }
+        context.fillStyle = palette.textDim; context.font = "12px " + palette.font;
+        const verdict = lateCycles > 0 ? "✕ " + lateCycles + " cycle 늦음" : "제때 도착";
+        const verdictX = Math.min(toX(Math.max(finish, ANSWER_NEEDED_CYCLE)) + 8, plotRight - context.measureText(verdict).width);
+        context.fillText(verdict, verdictX, row.top + BAR_HEIGHT + 16);
+        barRegions.push({ x: toX(row.start), y: row.top, width: toX(finish) - toX(row.start), height: BAR_HEIGHT, start: row.start, finish, lateCycles });
+      });
+
+      const neededX = Math.round(toX(ANSWER_NEEDED_CYCLE)) + 0.5;
+      context.strokeStyle = palette.text; context.lineWidth = 1.5; context.setLineDash([5, 4]);
+      context.beginPath(); context.moveTo(neededX, 14); context.lineTo(neededX, axisY); context.stroke();
+      context.setLineDash([]);
+      context.fillStyle = palette.text; context.font = "600 12px " + palette.font; context.textAlign = "left"; context.textBaseline = "alphabetic";
+      context.fillText("답이 필요한 시점", neededX + 6, 14);
+    });
+    BranchBook.attachTooltip("timing-canvas", (x, y) => {
+      const region = barRegions.find((candidate) => x >= candidate.x && x <= candidate.x + candidate.width && y >= candidate.y && y <= candidate.y + candidate.height);
+      if (!region) return null;
+      return { x, y: region.y, html: "조회 <b>" + region.start + "</b> → <b>" + region.finish + "</b> cycle · 늦은 구간 <b>" + region.lateCycles + "</b> cycle" };
+    });
+    refresh();
+  })();
+
+  /* ============================================================ 실험 2: 가능한 경로와 관찰한 경로 */
+  (function setupPatternsExperiment() {
+    const VISIT_COUNT = 512;
+    const RANDOM_SEED = 19;
+    const MAXIMUM_COLUMN_COUNT = 16;
+    const MINIMUM_CELL_WIDTH = 35;
+    const LARGE_CELL_HEIGHT = 44;
+    const SMALL_CELL_HEIGHT = 24;
+    const PATTERN_COUNT_FOR_SMALL_CELLS = 64;
+    const MINIMUM_HEIGHT_FOR_COUNT_LABEL = 20;
+    const CANVAS_PADDING = 10;
+    let visitCounts = [];
+    let cellRegions = [];
+
+    function columnCountFor(width) {
+      return Math.min(MAXIMUM_COLUMN_COUNT, Math.max(2, Math.floor((width - CANVAS_PADDING * 2) / MINIMUM_CELL_WIDTH)));
+    }
+    function cellHeightFor(patternCount) {
+      return patternCount > PATTERN_COUNT_FOR_SMALL_CELLS ? SMALL_CELL_HEIGHT : LARGE_CELL_HEIGHT;
+    }
+    function directionString(patternIndex, distance) {
+      return patternIndex.toString(2).padStart(distance, "0").replace(/0/g, "N").replace(/1/g, "T");
+    }
+    function refresh() {
+      const distance = distanceControl.value;
+      // 무작위 분기는 건너뛰는 분기보다 많을 수 없다.
+      randomControl.input.max = String(distance);
+      randomControl.set(Math.min(randomControl.value, distance));
+      const randomBranchCount = randomControl.value;
+      const random = BranchBook.createRandom(RANDOM_SEED);
+      visitCounts = new Array(2 ** distance).fill(0);
+      for (let visit = 0; visit < VISIT_COUNT; visit++) {
+        let patternIndex = 0;
+        for (let branchIndex = 0; branchIndex < distance; branchIndex++) {
+          const isRandomBranch = branchIndex < randomBranchCount;
+          const isTaken = isRandomBranch ? random() < 0.5 : branchIndex % 2 === 1;
+          patternIndex = patternIndex * 2 + (isTaken ? 1 : 0);
+        }
+        visitCounts[patternIndex]++;
+      }
+      const observedCount = visitCounts.filter((count) => count > 0).length;
+      BranchBook.setContent("patterns-possible", String(visitCounts.length));
+      BranchBook.setContent("patterns-observed", String(observedCount));
+      BranchBook.setContent("patterns-share", BranchBook.formatPercent(observedCount / visitCounts.length));
+      BranchBook.setContent("patterns-reads", visitCounts.length + " / 1");
+      patternsCanvas.resize();
+    }
+    const distanceControl = BranchBook.bindRange("patterns-distance", (value) => value + "개", refresh);
+    const randomControl = BranchBook.bindRange("patterns-random", (value) => value + "개", refresh);
+    const patternsCanvas = BranchBook.createCanvas("patterns-canvas", (context, width, height, palette) => {
+      const distance = distanceControl.value;
+      const columnCount = columnCountFor(width);
+      const cellWidth = (width - CANVAS_PADDING * 2) / columnCount;
+      const cellHeight = cellHeightFor(visitCounts.length);
+      cellRegions = [];
+      visitCounts.forEach((count, patternIndex) => {
+        const x = CANVAS_PADDING + (patternIndex % columnCount) * cellWidth;
+        const y = CANVAS_PADDING + Math.floor(patternIndex / columnCount) * cellHeight;
+        const isObserved = count > 0;
+        context.fillStyle = isObserved ? palette.accent : palette.surfaceStrong;
+        BranchBook.roundedRectangle(context, x + 1, y + 1, cellWidth - 2, cellHeight - 2, 3);
+        context.fill();
+        if (cellHeight >= MINIMUM_HEIGHT_FOR_COUNT_LABEL) {
+          context.fillStyle = isObserved ? "#ffffff" : palette.textFaint;
+          context.font = "11px " + palette.mono; context.textAlign = "center"; context.textBaseline = "middle";
+          context.fillText(String(count), x + cellWidth / 2, y + cellHeight / 2 + 1);
+        }
+        cellRegions.push({ x, y, width: cellWidth, height: cellHeight, count, directions: directionString(patternIndex, distance) });
+      });
+    }, {
+      // 조합 수에 따라 줄 수가 달라지므로 캔버스 높이를 내용에 맞춘다.
+      heightForWidth: (width) => Math.ceil(Math.max(visitCounts.length, 2) / columnCountFor(width)) * cellHeightFor(visitCounts.length) + CANVAS_PADDING * 2,
+    });
+    BranchBook.attachTooltip("patterns-canvas", (x, y) => {
+      const region = cellRegions.find((candidate) => x >= candidate.x && x < candidate.x + candidate.width && y >= candidate.y && y < candidate.y + candidate.height);
+      if (!region) return null;
+      return { x: region.x + region.width / 2, y: region.y, html: "방향열 <b>" + region.directions + "</b> · 방문 <b>" + region.count + "</b>회" };
+    });
+    refresh();
+  })();
+
+  /* ============================================================ 실험 3: secondary tag로 나중에 고르기 */
+  (function setupTagsExperiment() {
+    const BASE_TABLE_NAME = "T0 (기본)";
+    const BASE_TABLE_TAKEN = true;
+    const ENTRIES = [
+      { table: "T1", historyLength: 4, isPrimaryMatch: true, secondaryTag: "00", taken: true },
+      { table: "T2", historyLength: 8, isPrimaryMatch: true, secondaryTag: "01", taken: false },
+      { table: "T3", historyLength: 16, isPrimaryMatch: true, secondaryTag: "11", taken: false },
+      { table: "T4", historyLength: 32, isPrimaryMatch: false, secondaryTag: "11", taken: true },
+      { table: "T5", historyLength: 64, isPrimaryMatch: true, secondaryTag: "00", taken: false },
+    ];
+    function directionLabel(taken) {
+      return taken ? "T · taken" : "N · not-taken";
+    }
+    function describeStatus(entry, isContextChanged, missingHistory, provider) {
+      if (isContextChanged || !entry.isPrimaryMatch) return "앞쪽 문맥 불일치";
+      if (entry.secondaryTag !== missingHistory) return "중간 경로 불일치";
+      if (entry === provider) return "✓ 선택";
+      return "더 긴 후보가 있음";
+    }
+    function refresh() {
+      const missingHistory = historyControl.value;
+      const isContextChanged = primaryControl.checked;
+      const matchingEntries = ENTRIES.filter((entry) => !isContextChanged && entry.isPrimaryMatch && entry.secondaryTag === missingHistory);
+      // 두 tag가 모두 맞는 후보 가운데 history가 가장 긴 것이 예측을 제공한다.
+      const provider = matchingEntries[matchingEntries.length - 1];
+      const rows = ENTRIES.map((entry) => {
+        const isPrimaryMatch = !isContextChanged && entry.isPrimaryMatch;
+        const rowStyle = entry === provider ? ' style="background:var(--accent-soft)"' : "";
+        return "<tr" + rowStyle + "><td>" + entry.table + "</td><td>" + entry.historyLength + "</td><td>" + (isPrimaryMatch ? "일치" : "불일치") +
+          "</td><td>" + entry.secondaryTag + "</td><td>" + (entry.taken ? "T" : "N") + "</td><td>" + describeStatus(entry, isContextChanged, missingHistory, provider) + "</td></tr>";
+      });
+      BranchBook.setContent("tags-rows", rows.join(""));
+      BranchBook.setContent("tags-provider", provider ? provider.table : BASE_TABLE_NAME);
+      BranchBook.setContent("tags-result", directionLabel(provider ? provider.taken : BASE_TABLE_TAKEN));
+      BranchBook.renderOutcomeStrip("tags-strip", missingHistory.split("").map((bit, branchIndex) => ({ taken: bit === "1", title: "중간 분기 " + (branchIndex + 1) })));
+    }
+    const historyControl = BranchBook.bindSegmented("tags-history", refresh);
+    const primaryControl = BranchBook.bindCheckbox("tags-primary", refresh);
+    refresh();
+  })();
+
+  /* ============================================================ 퀴즈 */
+  BranchBook.renderQuiz("chapter-quiz", [
+    {
+      question: "예측이 모두 맞더라도 예측기가 느리면 손해가 생기는 이유는?",
+      options: ["느린 예측기는 전력을 쓰지 않아서", "빠른 답으로 먼저 진행한 뒤 늦게 온 정확한 답이 다르면 그 사이 가져온 명령을 버려야 해서", "느린 예측기는 history를 쓰지 못해서", "분기가 실행되지 않아서"],
+      answerIndex: 1,
+      explanation: "두 예측기의 답이 다를 때마다 fetch를 되돌린다. 분기를 실행한 뒤 드러나는 오예측과는 별개의 손실이다.",
+    },
+    {
+      question: "선행 조회를 시작할 때 모르는 정보는?",
+      options: ["이미 지나간 전체 history", "조회 시작과 목표 분기 사이의 경로", "예측기의 표 크기", "목표 분기의 주소 폭"],
+      answerIndex: 1,
+      explanation: "이 구간이 missing history다. 그래서 여러 후보를 준비해 두고 나중에 고른다.",
+    },
+    {
+      question: "secondary tag는 맞지만 primary tag가 틀린 entry는 어떻게 되는가?",
+      options: ["history가 가장 길면 쓴다", "taken일 때만 쓴다", "다른 앞쪽 문맥의 entry이므로 제외한다", "항상 우선한다"],
+      answerIndex: 2,
+      explanation: "두 tag가 모두 맞아야 지금의 문맥과 중간 경로에 맞는 후보다.",
+    },
+    {
+      question: "가능한 조합이 32개인데 관찰된 조합이 2개라면, 에너지도 정확히 16분의 1이 되는가?",
+      options: ["아니다. 표 읽기 말고도 tag, 선택 회로, queue의 비용이 있다", "항상 그렇다", "IPC가 정확히 16배 오른다", "저장 공간이 16분의 1이 된다"],
+      answerIndex: 0,
+      explanation: "경로가 드물다는 것은 설계의 기회일 뿐이다. 논문은 표 읽기 에너지를 약 1.5배로 보고했고, 이는 코어 전체 에너지가 아니다.",
+    },
+    {
+      question: "Ahead Prediction이 보고한 성능 향상 4.4%의 주된 원인은?",
+      options: ["오예측 수를 크게 줄여서", "정확한 예측기의 답을 제때 받아 조회 지연을 가려서", "offline profile을 써서", "값을 미리 계산해서"],
+      answerIndex: 1,
+      explanation: "정확도는 거의 그대로다. 3-cycle overriding TAGE 기준, SPEC CPU2017, 16-wide 코어에서의 값이다.",
+    },
+  ]);
+})();
+</script>
 </body>
 </html>
