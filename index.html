@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BranchBook · H2P 분기예측 교과서</title>
+<meta name="description" content="왜 일부 분기는 계속 틀릴까? 최근 H2P(Hard-to-Predict branch) 논문 12편을 그림과 실험으로 읽는 인터랙티브 교과서.">
+<meta property="og:type" content="website">
+<meta property="og:title" content="BranchBook · H2P 분기예측 교과서">
+<meta property="og:description" content="최근 H2P 논문 12편을 그림과 실험으로 읽는 인터랙티브 교과서.">
+<meta property="og:locale" content="ko_KR">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="css/style.css">
+<script src="js/common.js"></script>
+<style>
+  .lifetime svg { min-width: 860px; }
+  .lifetime a text { cursor: pointer; }
+  .lifetime a:hover rect { stroke-width: 2.5; }
+  .usage { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); padding-bottom: 12px; }
+  .usage div { padding: 16px 18px; border-radius: var(--radius); background: var(--elevated); border: 1px solid var(--border); font-size: 14.5px; color: var(--text-dim); line-height: 1.6; }
+  .usage b { display: block; color: var(--text); font-size: 16px; margin-bottom: 4px; }
+</style>
+</head>
+<body data-root="">
+
+<section class="home-hero">
+  <div class="home-hero-inner">
+    <div>
+      <h1>왜 어떤 분기는<br>계속 틀릴까</h1>
+      <p class="lead">프로세서는 조건의 답이 나오기 전에 다음 명령을 가져옵니다. 대부분은 맞히지만, 몇몇 분기는 끝까지 틀립니다. 이 책은 그런 분기(H2P)를 다룬 최근 논문 열두 편을, 직접 돌려 보는 실험과 그림으로 읽습니다.</p>
+      <div class="home-actions">
+        <a class="primary" href="chapters/basics.html">1장부터 읽기</a>
+        <a class="secondary" href="chapters/synthesis.html">열두 편 한눈에 보기</a>
+      </div>
+      <div class="home-facts">
+        <span>11개 장</span><span>실험 30여 개</span><span>논문 12편, 2020–2026</span><span>학부 컴퓨터구조 수준</span>
+      </div>
+    </div>
+    <div class="hero-stage" id="hero-stage">
+      <canvas id="hero-canvas" data-height="300" aria-label="파이프라인을 흐르는 명령과 오예측 때 버려지는 명령을 보여 주는 애니메이션"></canvas>
+      <div class="hero-stage-controls">
+        <div class="segmented" id="hero-pattern" aria-label="분기 유형">
+          <button data-value="loop" class="on">반복되는 루프</button>
+          <button data-value="biased">한쪽으로 치우침</button>
+          <button data-value="data">값에 따라 결정</button>
+        </div>
+        <button class="button" id="hero-play">멈춤</button>
+        <span class="hero-stage-readout" id="hero-readout">정확도 — · 버린 명령 0</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="home-section">
+  <h2>분기 하나가 겪는 일, 그리고 논문들이 손대는 자리</h2>
+  <p class="section-lead">분기는 가져올 때 방향을 <b>예측</b>하고, 실행할 때 <b>확인</b>합니다. 틀렸다면 그 사이에 가져온 명령을 모두 버립니다. 열두 편의 논문은 이 흐름의 서로 다른 지점을 고칩니다.</p>
+  <figure class="diagram lifetime">
+    <svg viewBox="0 0 1100 318" role="img" aria-label="분기의 예측에서 확인까지의 흐름과 여섯 범주가 개입하는 위치">
+      <defs>
+        <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrow-head"/></marker>
+      </defs>
+      <rect x="20" y="52" width="176" height="62" rx="10" class="fill-accent-soft"/>
+      <text x="108" y="79" text-anchor="middle" class="label-strong">Fetch</text>
+      <text x="108" y="99" text-anchor="middle" class="label-dim">방향을 예측한다</text>
+      <path d="M200 83 H236" class="stroke-line" marker-end="url(#arrow)"/>
+      <rect x="240" y="52" width="150" height="62" rx="10" class="fill-surface"/>
+      <text x="315" y="79" text-anchor="middle" class="label-strong">Decode · Rename</text>
+      <text x="315" y="99" text-anchor="middle" class="label-dim">예측한 경로를 따라감</text>
+      <path d="M394 83 H430" class="stroke-line" marker-end="url(#arrow)"/>
+      <rect x="434" y="52" width="150" height="62" rx="10" class="fill-surface"/>
+      <text x="509" y="79" text-anchor="middle" class="label-strong">실행 대기</text>
+      <text x="509" y="99" text-anchor="middle" class="label-dim">필요한 값을 기다림</text>
+      <path d="M588 83 H624" class="stroke-line" marker-end="url(#arrow)"/>
+      <rect x="628" y="52" width="176" height="62" rx="10" class="fill-accent-soft"/>
+      <text x="716" y="79" text-anchor="middle" class="label-strong">Execute</text>
+      <text x="716" y="99" text-anchor="middle" class="label-dim">실제 방향을 확인한다</text>
+      <path d="M808 70 C830 60 836 44 858 40" class="stroke-taken" marker-end="url(#arrow)"/>
+      <path d="M808 96 C830 106 836 122 858 126" class="stroke-mispredict" marker-end="url(#arrow)"/>
+      <rect x="862" y="18" width="220" height="44" rx="10" class="fill-taken-soft"/>
+      <text x="972" y="45" text-anchor="middle" class="label">맞음 · 그대로 진행</text>
+      <rect x="862" y="104" width="220" height="44" rx="10" class="fill-mispredict-soft"/>
+      <text x="972" y="131" text-anchor="middle" class="label">틀림 ✕ · 버리고 다시 채움</text>
+
+      <path d="M20 172 H196" class="stroke-dashed"/>
+      <path d="M240 172 H804" class="stroke-dashed"/>
+      <path d="M862 172 H1082" class="stroke-dashed"/>
+      <text x="20" y="196" class="label-accent">더 정확하게, 제때</text>
+      <text x="240" y="196" class="label-accent">확인 전에 먼저 계산하고, 일찍 고친다</text>
+      <text x="862" y="196" class="label-accent">틀린 뒤의 손실을 줄인다</text>
+
+      <a href="chapters/correlation.html"><rect x="20" y="210" width="176" height="28" rx="14" class="fill-elevated"/><text x="108" y="229" text-anchor="middle" class="label-dim">A · 묻힌 상관 찾기</text></a>
+      <a href="chapters/state.html"><rect x="20" y="244" width="176" height="28" rx="14" class="fill-elevated"/><text x="108" y="263" text-anchor="middle" class="label-dim">C · 패턴 보관·선별</text></a>
+      <a href="chapters/latency.html"><rect x="20" y="278" width="176" height="28" rx="14" class="fill-elevated"/><text x="108" y="297" text-anchor="middle" class="label-dim">F · 느린 예측기 앞당기기</text></a>
+      <a href="chapters/value.html"><rect x="240" y="210" width="270" height="28" rx="14" class="fill-elevated"/><text x="375" y="229" text-anchor="middle" class="label-dim">B · 값과 선행 계산 (Runahead, RUNLTS)</text></a>
+      <a href="chapters/value.html#tea"><rect x="524" y="210" width="280" height="28" rx="14" class="fill-elevated"/><text x="664" y="229" text-anchor="middle" class="label-dim">B · 늦게 온 결과로 조기 수정 (TEA)</text></a>
+      <a href="chapters/loop.html"><rect x="240" y="244" width="270" height="28" rx="14" class="fill-elevated"/><text x="375" y="263" text-anchor="middle" class="label-dim">D · 얽힌 루프 분기 (Phelps)</text></a>
+      <a href="chapters/recovery.html"><rect x="862" y="210" width="220" height="28" rx="14" class="fill-elevated"/><text x="972" y="229" text-anchor="middle" class="label-dim">E · 반대 경로 준비 (APF)</text></a>
+      <a href="chapters/recovery.html#sbrb"><rect x="862" y="244" width="220" height="28" rx="14" class="fill-elevated"/><text x="972" y="263" text-anchor="middle" class="label-dim">E · 취소된 결과 재사용 (SBRB)</text></a>
+    </svg>
+    <figcaption><b>그림 0-1.</b> 분기의 일생과 여섯 범주(A–F)의 위치. 알약 모양을 누르면 해당 장으로 이동합니다. 범주는 서로 겹칠 수 있습니다.</figcaption>
+  </figure>
+</section>
+
+<section class="home-section">
+  <h2>H2P를 보는 여섯 관점</h2>
+  <p class="section-lead">A–C는 분기가 어려운 주된 원인, D는 반복 실행 구조, E는 남은 손실, F는 예측이 도착하는 시간을 다룹니다.</p>
+  <div class="category-map">
+    <a class="category-item" href="chapters/correlation.html"><span class="category-letter">A</span><h3>History 상관</h3><p>단서는 과거 기록에 있지만 멀리 있거나 noise에 묻혀 있다.</p><span class="category-papers">BranchNet</span></a>
+    <a class="category-item" href="chapters/value.html"><span class="category-letter">B</span><h3>데이터와 값</h3><p>방향이 방금 읽은 값에 달려 있어 과거 방향만으로는 알 수 없다.</p><span class="category-papers">Branch Runahead · TEA · RUNLTS</span></a>
+    <a class="category-item" href="chapters/state.html"><span class="category-letter">C</span><h3>상태와 학습</h3><p>기억할 패턴이 너무 많거나, 쓸모없는 패턴이 자리를 차지한다.</p><span class="category-papers">Whisper · LLBP · LLBP-X · PURE</span></a>
+    <a class="category-item" href="chapters/loop.html"><span class="category-letter">D</span><h3>얽힌 루프</h3><p>루프 안의 어려운 분기가 다른 어려운 분기와 store에 의존한다.</p><span class="category-papers">Phelps</span></a>
+    <a class="category-item" href="chapters/recovery.html"><span class="category-letter">E</span><h3>남은 오예측</h3><p>결국 틀리는 분기의 복구 시간과 버려지는 계산을 줄인다.</p><span class="category-papers">Alternate Path Fetch · SBRB</span></a>
+    <a class="category-item" href="chapters/latency.html"><span class="category-letter">F</span><h3>예측기 지연</h3><p>맞힐 수는 있지만 정확한 답이 몇 cycle 늦게 나온다.</p><span class="category-papers">Ahead Prediction</span></a>
+  </div>
+</section>
+
+<section class="home-section">
+  <h2>논문이 보고한 숫자들</h2>
+  <p class="section-lead">각 숫자는 그 논문의 baseline과 workload에서만 성립합니다. 조건이 서로 달라 한 줄로 순위를 매길 수 없습니다. 이 책을 읽고 나면 왜 그런지 설명할 수 있습니다.</p>
+  <div class="fact-grid">
+    <div><b>76.4%</b><span>Whisper가 분류한 데이터센터 오예측 중 용량 원인의 비율</span></div>
+    <div><b>−43.6%</b><span>Branch Runahead(Mini)의 MPKI 감소. 선정한 SPEC·GAP 17개</span></div>
+    <div><b>+10.1%</b><span>TEA의 성능 향상. Fetch에 늦은 결과도 조기 수정에 쓴다</span></div>
+    <div><b>−12.1%</b><span>LLBP-X의 서버 MPKI 감소(LLBP는 −8.9%). 성능은 약 1%</span></div>
+    <div><b>+64%</b><span>Phelps의 GAP bfs 성능 향상. 다룰 수 있는 루프가 있을 때</span></div>
+    <div><b>+4.4%</b><span>Ahead Prediction. 정확도는 그대로 두고 지연만 줄였다</span></div>
+  </div>
+</section>
+
+<section class="home-section">
+  <h2>전체 챕터</h2>
+  <p class="section-lead">1–3장에서 기초를 다지고, 4–9장에서 범주별 논문을 읽고, 10장에서 한 지도로 모읍니다. 각 장은 문제, 아이디어, 실험, 논문 결과, 퀴즈 순서입니다.</p>
+  <div class="chapter-grid" id="chapter-grid"></div>
+</section>
+
+<section class="home-section">
+  <h2>추천 읽기 순서</h2>
+  <p class="section-lead">관심사에 따라 골라 읽어도 됩니다.</p>
+  <div class="reading-paths">
+    <div class="reading-path"><h3>처음 배우는 분</h3><p>분기예측이 처음이라면 기초 세 장으로 전체 그림을 잡은 뒤 종합으로 건너뜁니다.</p><div class="path-steps"><a href="chapters/basics.html">01</a><a href="chapters/history.html">02</a><a href="chapters/h2p.html">03</a><a href="chapters/synthesis.html">10</a></div></div>
+    <div class="reading-path"><h3>예측기 설계</h3><p>예측기 자체의 정확도와 용량, 지연을 다루는 흐름입니다.</p><div class="path-steps"><a href="chapters/history.html">02</a><a href="chapters/correlation.html">04</a><a href="chapters/state.html">06</a><a href="chapters/latency.html">09</a></div></div>
+    <div class="reading-path"><h3>선행 실행과 helper</h3><p>예측 대신 계산으로 답을 얻는 접근을 따라갑니다.</p><div class="path-steps"><a href="chapters/h2p.html">03</a><a href="chapters/value.html">05</a><a href="chapters/loop.html">07</a><a href="chapters/recovery.html">08</a></div></div>
+    <div class="reading-path"><h3>서버 workload</h3><p>코드가 크고 오예측이 수천 개 분기에 흩어진 환경의 문제입니다.</p><div class="path-steps"><a href="chapters/h2p.html">03</a><a href="chapters/state.html">06</a><a href="chapters/synthesis.html">10</a></div></div>
+  </div>
+</section>
+
+<section class="home-section">
+  <h2>이 책을 쓰는 법</h2>
+  <div class="usage">
+    <div><b>읽기</b>문제부터 시작합니다. 영어 용어는 논문에서 쓰는 그대로 두고 처음 나올 때 뜻을 풉니다.</div>
+    <div><b>보기</b>구조도는 모두 새로 그렸습니다. 원문의 그림 번호를 함께 적었습니다.</div>
+    <div><b>만지기</b>슬라이더를 끝까지 밀어 보세요. 기법이 실패하는 조건에서 가장 많이 배웁니다.</div>
+    <div><b>구분하기</b>실험은 축소 모델입니다. 논문의 측정값은 조건과 함께 따로 표시합니다.</div>
+  </div>
+</section>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ---------------------------------------------------------- 챕터 카드 */
+  const chapterGrid = document.getElementById("chapter-grid");
+  chapterGrid.innerHTML = BranchBook.chapters.map((chapter) => {
+    const categoryTag = chapter.category ? "<span>범주 " + chapter.category + "</span>" : "<span>" + chapter.group + "</span>";
+    const experimentTag = chapter.experimentCount > 0 ? '<span class="experiments">실험 ' + chapter.experimentCount + "개</span>" : "";
+    return '<a class="chapter-card" href="chapters/' + chapter.slug + '.html">' +
+      '<span class="card-number">' + Number(chapter.number) + "장</span>" +
+      "<h3>" + chapter.title + "</h3><p>" + chapter.description + "</p>" +
+      '<div class="card-tags">' + categoryTag + experimentTag + "</div></a>";
+  }).join("");
+
+  /* ---------------------------------------------------------- 히어로: 흐르는 파이프라인
+     가져온 명령이 왼쪽에서 오른쪽으로 흐르다가, 분기가 확인 지점에 닿았을 때 틀렸다면
+     그 뒤에 가져온 명령이 모두 버려지는 모습을 보여 준다. */
+  const PIPELINE_SLOT_COUNT = 12;
+  const RESOLVE_SLOT = PIPELINE_SLOT_COUNT - 1;
+  const BRANCH_INTERVAL = 3;
+  const SECONDS_PER_STEP = 0.24;
+  const RECENT_OUTCOME_COUNT = 22;
+  const LOOP_TRIP_COUNT = 5;
+  const BIASED_TAKEN_PROBABILITY = 0.9;
+  const BRANCH_ADDRESS = 64;
+  const DISCARD_FLASH_STEP_COUNT = 2;
+  const PREDICTOR_TRAINING_BRANCH_COUNT = 300;
+
+  const random = BranchBook.createRandom(2027);
+  let predictor = BranchBook.predictors.createGshare({ indexBits: 8, historyLength: 6 });
+  let slots = [];
+  let fetchedCount = 0;
+  let branchSequence = 0;
+  let isOnWrongPath = false;
+  let resolvedBranchCount = 0;
+  let correctBranchCount = 0;
+  let discardedInstructionCount = 0;
+  let recentOutcomes = [];
+  let flashRemaining = 0;
+  let stepProgress = 0;
+
+  function actualOutcome(patternName) {
+    if (patternName === "loop") return branchSequence % LOOP_TRIP_COUNT !== LOOP_TRIP_COUNT - 1;
+    if (patternName === "biased") return random() < BIASED_TAKEN_PROBABILITY;
+    return random() < 0.5;
+  }
+  function resetHero() {
+    predictor.reset();
+    slots = new Array(PIPELINE_SLOT_COUNT).fill(null);
+    fetchedCount = 0; branchSequence = 0; isOnWrongPath = false;
+    resolvedBranchCount = 0; correctBranchCount = 0; discardedInstructionCount = 0;
+    recentOutcomes = []; flashRemaining = 0; stepProgress = 0;
+    // 화면에 보이기 전에 예측기를 먼저 학습시킨다. 갓 켠 예측기의 초기 오예측이 유형별 차이를 가리지 않게 하기 위해서다.
+    for (let trainingStep = 0; trainingStep < PREDICTOR_TRAINING_BRANCH_COUNT; trainingStep++) {
+      predictor.update(BRANCH_ADDRESS, actualOutcome(patternControl.value));
+      branchSequence++;
+    }
+    for (let warmupStep = 0; warmupStep < PIPELINE_SLOT_COUNT * 5; warmupStep++) advance(patternControl.value);
+    heroCanvas.redraw();
+  }
+  function fetchInstruction(patternName) {
+    const isBranch = fetchedCount % BRANCH_INTERVAL === BRANCH_INTERVAL - 1;
+    fetchedCount++;
+    if (!isBranch) return { isBranch: false, isWrongPath: isOnWrongPath };
+    if (isOnWrongPath) {
+      // 잘못된 경로에서 만난 분기는 실제 프로그램의 분기가 아니므로 학습에 쓰지 않는다.
+      return { isBranch: true, isWrongPath: true, predictedTaken: random() < 0.5, isCorrect: true };
+    }
+    const taken = actualOutcome(patternName);
+    const predictedTaken = predictor.predict(BRANCH_ADDRESS).taken;
+    predictor.update(BRANCH_ADDRESS, taken);
+    branchSequence++;
+    const isCorrect = predictedTaken === taken;
+    if (!isCorrect) isOnWrongPath = true;
+    return { isBranch: true, isWrongPath: false, predictedTaken, taken, isCorrect };
+  }
+  function advance(patternName) {
+    const resolving = slots[RESOLVE_SLOT];
+    for (let slotIndex = RESOLVE_SLOT; slotIndex > 0; slotIndex--) slots[slotIndex] = slots[slotIndex - 1];
+    slots[0] = fetchInstruction(patternName);
+    if (resolving && resolving.isBranch && !resolving.isWrongPath) {
+      resolvedBranchCount++;
+      if (resolving.isCorrect) correctBranchCount++;
+      recentOutcomes.push({ taken: resolving.taken, isMispredicted: !resolving.isCorrect });
+      if (recentOutcomes.length > RECENT_OUTCOME_COUNT) recentOutcomes.shift();
+      if (!resolving.isCorrect) {
+        // 확인 지점보다 뒤에 있는 명령은 모두 잘못된 경로에서 가져온 것이다.
+        for (let slotIndex = 0; slotIndex < PIPELINE_SLOT_COUNT; slotIndex++) {
+          if (slots[slotIndex]) { slots[slotIndex].isDiscarded = true; discardedInstructionCount++; }
+        }
+        isOnWrongPath = false;
+        flashRemaining = DISCARD_FLASH_STEP_COUNT;
+      }
+    } else if (flashRemaining > 0) {
+      // 버려진 명령을 잠깐 보여 준 뒤 지운다. 지운 자리는 빈칸(bubble)으로 남아 다시 채워진다.
+      flashRemaining--;
+      if (flashRemaining === 0) slots = slots.map((slot) => (slot && slot.isDiscarded ? null : slot));
+    }
+    refreshReadout();
+  }
+  function refreshReadout() {
+    const accuracyText = resolvedBranchCount === 0 ? "—" : BranchBook.formatPercent(correctBranchCount / resolvedBranchCount, 0);
+    BranchBook.setContent("hero-readout", "정확도 " + accuracyText + " · 버린 명령 " + discardedInstructionCount);
+  }
+
+  const patternControl = BranchBook.bindSegmented("hero-pattern", resetHero);
+
+  const heroCanvas = BranchBook.createCanvas("hero-canvas", (context, width, height, palette) => {
+    const horizontalPadding = 22;
+    const gap = 5;
+    const cellSize = Math.min(44, (width - horizontalPadding * 2 - gap * (PIPELINE_SLOT_COUNT - 1)) / PIPELINE_SLOT_COUNT);
+    const rowWidth = cellSize * PIPELINE_SLOT_COUNT + gap * (PIPELINE_SLOT_COUNT - 1);
+    const rowLeft = (width - rowWidth) / 2;
+    const rowTop = 84;
+
+    context.font = "600 13px " + palette.font;
+    context.fillStyle = palette.textDim;
+    context.textBaseline = "alphabetic";
+    context.textAlign = "left";
+    context.fillText("Fetch: 방향을 예측하고 가져온다", rowLeft, rowTop - 34);
+    context.textAlign = "right";
+    context.fillText("Execute: 확인", rowLeft + rowWidth, rowTop - 34);
+    context.strokeStyle = palette.axis;
+    context.lineWidth = 1.5;
+    context.beginPath();
+    context.moveTo(rowLeft, rowTop - 20); context.lineTo(rowLeft + rowWidth, rowTop - 20);
+    context.moveTo(rowLeft + rowWidth - 7, rowTop - 25); context.lineTo(rowLeft + rowWidth, rowTop - 20); context.lineTo(rowLeft + rowWidth - 7, rowTop - 15);
+    context.stroke();
+
+    slots.forEach((slot, slotIndex) => {
+      const x = rowLeft + slotIndex * (cellSize + gap);
+      BranchBook.roundedRectangle(context, x, rowTop, cellSize, cellSize, 8);
+      if (!slot) { context.strokeStyle = palette.border; context.lineWidth = 1; context.setLineDash([3, 3]); context.stroke(); context.setLineDash([]); return; }
+      if (slot.isBranch) context.fillStyle = slot.predictedTaken ? palette.taken : palette.notTaken;
+      else context.fillStyle = palette.surfaceStrong;
+      context.globalAlpha = slot.isDiscarded ? 0.35 : 1;
+      context.fill();
+      context.globalAlpha = 1;
+      if (slot.isBranch) {
+        context.fillStyle = "#ffffff";
+        context.font = "600 " + Math.round(cellSize * 0.36) + "px " + palette.mono;
+        context.textAlign = "center"; context.textBaseline = "middle";
+        context.fillText(slot.predictedTaken ? "T" : "N", x + cellSize / 2, rowTop + cellSize / 2 + 1);
+      }
+      if (slot.isDiscarded) {
+        context.strokeStyle = palette.mispredict; context.lineWidth = 2;
+        BranchBook.roundedRectangle(context, x, rowTop, cellSize, cellSize, 8); context.stroke();
+        context.beginPath();
+        context.moveTo(x + cellSize * 0.3, rowTop + cellSize * 0.3); context.lineTo(x + cellSize * 0.7, rowTop + cellSize * 0.7);
+        context.moveTo(x + cellSize * 0.7, rowTop + cellSize * 0.3); context.lineTo(x + cellSize * 0.3, rowTop + cellSize * 0.7);
+        context.stroke();
+      }
+    });
+    // 확인 지점 표시
+    const resolveX = rowLeft + RESOLVE_SLOT * (cellSize + gap);
+    context.strokeStyle = palette.accent; context.lineWidth = 2;
+    BranchBook.roundedRectangle(context, resolveX - 3, rowTop - 3, cellSize + 6, cellSize + 6, 10); context.stroke();
+
+    context.textAlign = "left"; context.textBaseline = "alphabetic";
+    context.font = "12px " + palette.font; context.fillStyle = palette.textDim;
+    const legendTop = rowTop + cellSize + 30;
+    const legendItems = [[palette.taken, "taken으로 예측한 분기"], [palette.notTaken, "not-taken으로 예측한 분기"], [palette.surfaceStrong, "분기가 아닌 명령"]];
+    let legendX = rowLeft;
+    legendItems.forEach(([swatchColor, legendLabel]) => {
+      context.fillStyle = swatchColor;
+      BranchBook.roundedRectangle(context, legendX, legendTop - 10, 12, 12, 3); context.fill();
+      context.fillStyle = palette.textDim;
+      context.fillText(legendLabel, legendX + 17, legendTop);
+      legendX += 17 + context.measureText(legendLabel).width + 16;
+      if (legendX > rowLeft + rowWidth - 120) { legendX = rowLeft; }
+    });
+
+    const stripTop = legendTop + 42;
+    context.font = "600 13px " + palette.font; context.fillStyle = palette.textDim;
+    context.fillText("확인된 실제 방향 (최근 순서, ✕는 오예측)", rowLeft, stripTop - 12);
+    const stripCell = Math.min(20, (rowWidth - (RECENT_OUTCOME_COUNT - 1) * 4) / RECENT_OUTCOME_COUNT);
+    recentOutcomes.forEach((outcome, outcomeIndex) => {
+      const x = rowLeft + outcomeIndex * (stripCell + 4);
+      context.fillStyle = outcome.taken ? palette.taken : palette.notTaken;
+      BranchBook.roundedRectangle(context, x, stripTop, stripCell, stripCell, 5); context.fill();
+      if (outcome.isMispredicted) {
+        context.strokeStyle = palette.mispredict; context.lineWidth = 2;
+        BranchBook.roundedRectangle(context, x - 3, stripTop - 3, stripCell + 6, stripCell + 6, 7); context.stroke();
+        context.fillStyle = palette.mispredict; context.font = "600 11px " + palette.mono; context.textAlign = "center";
+        context.fillText("✕", x + stripCell / 2, stripTop + stripCell + 15);
+        context.textAlign = "left";
+      }
+    });
+  });
+
+  const heroLoop = BranchBook.createAnimationLoop("hero-stage", (deltaSeconds) => {
+    stepProgress += deltaSeconds;
+    if (stepProgress < SECONDS_PER_STEP) return;
+    stepProgress = 0;
+    advance(patternControl.value);
+    heroCanvas.redraw();
+  });
+  const playButton = BranchBook.bindButton("hero-play", () => {
+    if (heroLoop.isPlaying) heroLoop.pause(); else heroLoop.play();
+    playButton.textContent = heroLoop.isPlaying ? "멈춤" : "재생";
+  });
+  playButton.textContent = heroLoop.isPlaying ? "멈춤" : "재생";
+
+  resetHero();
+})();
+</script>
+</body>
+</html>
