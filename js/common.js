@@ -19,7 +19,8 @@
     { slug: "recovery", number: "08", group: "논문", category: "E", title: "남은 오예측의 비용: APF, SBRB", description: "틀린 뒤의 손실을 줄인다. 반대 경로를 미리 준비하고, 취소된 분기의 결과를 다시 쓴다.", experimentCount: 3 },
     { slug: "latency", number: "09", group: "논문", category: "F", title: "늦게 오는 정답: Ahead Prediction", description: "정확한 예측기가 느리면 명령 공급이 끊긴다. 조회를 미리 시작하고 빠진 history는 나중에 고른다.", experimentCount: 3 },
     { slug: "synthesis", number: "10", group: "정리", title: "종합: 정보·상태·시간", description: "열두 편을 한 지도에 올린다. 무엇을 더 쓰고, 언제 개입하고, 어떤 비용을 치르는가.", experimentCount: 3 },
-    { slug: "glossary", number: "11", group: "정리", title: "용어집, 종합 퀴즈, 참고문헌", description: "핵심 용어를 검색하고, 전체 내용을 퀴즈로 점검하고, 원문으로 이동한다.", experimentCount: 0 },
+    { slug: "research", number: "11", group: "정리", title: "연구 계획: 무엇을 검증할 것인가", description: "예측기 제어, 값 도착 시점, 관련 이력 선택을 검증한다. 컴파일러 분기 관계 그래프의 가능성과 평가 순서.", experimentCount: 0 },
+    { slug: "glossary", number: "12", group: "정리", title: "용어집, 종합 퀴즈, 참고문헌", description: "핵심 용어를 검색하고, 전체 내용을 퀴즈로 점검하고, 원문으로 이동한다.", experimentCount: 0 },
   ];
 
   const BranchBook = (window.BranchBook = {});
